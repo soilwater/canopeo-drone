@@ -1,0 +1,15 @@
+# Build artifacts
+/dist/
+/build/
+*.spec
+__pycache__/
+*.pyc
+
+# Local sample data (large; not part of the app)
+/Soybean Tiff Files/
+/example_image_psscene*/
+*.tif
+!demo/*.tif
+
+# Inno Setup output
+/installer/Output/

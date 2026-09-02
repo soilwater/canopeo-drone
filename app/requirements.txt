@@ -1,0 +1,34 @@
+# Canopeo Drone runtime + build dependencies (pinned from the working env).
+# Build from a clean venv so PyInstaller's import graph stays small:
+#   python -m venv venv && venv\Scripts\pip install -r requirements.txt
+
+# guile 0.8.5 is not on PyPI yet; install from the repo:
+guile @ git+https://github.com/andpatrig/guile.git
+
+rasterio==1.3.10
+numpy==1.26.4
+pillow==10.4.0
+geopandas==1.1.3
+shapely==2.1.2
+pyproj==3.6.1
+pyogrio==0.9.0
+pandas==2.3.3
+rawpy==0.27.1
+pywebview==6.2.1
+pythonnet==3.0.5
+clr-loader==0.2.10
+proxy-tools==0.1.0
+bottle==0.13.4
+affine==2.4.0
+attrs==23.1.0
+certifi==2026.4.22
+click==8.1.7
+click-plugins==1.1.1
+cligj==0.7.2
+snuggs==1.4.7
+packaging==26.2
+typing_extensions==4.12.2
+
+# packaging
+pyinstaller==6.11.1
+setuptools==75.8.0
