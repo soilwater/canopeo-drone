@@ -13,9 +13,8 @@ Project page: https://soilwater.github.io/canopeo-drone/
 ## Who needs what
 
 * **End users** run the packaged `.exe` (see Packaging). It bundles Python,
-  guile, and every library — including `rawpy` for camera RAW — so nothing
-  needs to be installed. Windows 10/11 already has the WebView2 runtime it
-  uses.
+  guile, and every library, so nothing needs to be installed. Windows 10/11
+  already has the WebView2 runtime it uses.
 * **Running from source** needs Python 3.11+ and `guile >= 0.8.7`, plus the
   packages in `app/requirements.txt`.
 * **Building the installer** needs `guile >= 0.8.7` (see Packaging).
@@ -26,7 +25,6 @@ Project page: https://soilwater.github.io/canopeo-drone/
 * `app/engine.py` — all processing; no UI dependencies, importable from scripts.
 * `app/tileserver.py` — optional on-demand tile server (see below).
 * `app/build.py`, `app/requirements.txt` — packaging.
-* `demo/` — one sample photo (`demo_1.jpg`).
 * `icons/`, `assets/` — app icon and the KSU / OSU logos shown in About.
 * `LICENSE.txt` — PolyForm Noncommercial 1.0.0.
 
@@ -38,15 +36,10 @@ python app/main.py            # add --dev for hot reload
 
 ## Inputs
 
-| Format | Cover | Map overlay | Per-area (GeoJSON) |
-|---|---|---|---|
-| GeoTIFF (RGB, RGBA, multispectral, any bit depth) | full-res, streamed | yes | yes |
-| PNG / JPEG | full-res | no (not georeferenced) | no |
-| Camera RAW (.dng .cr2 .nef .arw …) | full-res | no | no |
-
-RAW support is built into the packaged app (`rawpy` is bundled). When running
-from source, `rawpy` is an optional install — without it, RAW files report a
-clear message and the other formats keep working.
+Canopeo Drone takes **georeferenced GeoTIFF orthomosaics** only (RGB, RGBA, or
+multispectral, any bit depth). A file without a coordinate system, or a plain
+photo (JPEG, PNG, camera RAW), is rejected at load with a note pointing to
+Canopeo Drag&Drop — the companion tool for ordinary photos.
 
 Multispectral band mapping is detected from the file's color tags, then by
 sensor preset (8-band PlanetScope → R6/G4/B2, 5-band MicaSense → R3/G2/B1),
@@ -76,8 +69,11 @@ else bands 1/2/3.
 ## Controls
 
 * Thresholds are sliders (R/G and B/G 0.85–1.15, excess green 0–50) with a
-  Reset button. Every change re-renders the map tiles instantly and re-runs
-  the full-resolution cover in the background (progress bar under the badge).
+  Reset button. Dragging a threshold updates the map overlay live and shows a
+  quick preview cover from a downscaled image; press **Recompute** for the
+  exact full-resolution value (a deliberate step, since that pass is the
+  expensive one on large files). Mask blend and color are display-only and
+  never trigger a recompute.
 * *Mask blend* mixes the mask color into the image (0 = plain image);
   *Show overlay* hides the classified layer to compare with the basemap.
 * About / Guidelines / License live in the top toolbar; the license text is
@@ -101,8 +97,7 @@ generic hard parts — bundling only the native WebView2 backend, raising the
 recursion limit, and putting conda's `Library\bin` on PATH during the build.
 `build.py` adds the geospatial specifics: the GDAL / PROJ data directories, a
 full collection of `rasterio` / `pyproj` / `pyogrio` (compiled submodules
-PyInstaller cannot see statically), the icon, license, logos, and demo image,
-and excludes for the heavy optional stacks (TensorFlow, dask, numba, OpenCV, …)
+PyInstaller cannot see statically), the icon, license, and logos, and excludes for the heavy optional stacks (TensorFlow, dask, numba, OpenCV, …)
 that pandas/geopandas extras would otherwise pull in from a full environment.
 Building from a clean venv (`app/requirements.txt`) makes those excludes
 unnecessary.
@@ -116,8 +111,8 @@ Verify a build without opening a window:
 dist\CanopeoDrone\CanopeoDrone.exe --smoke smoke.txt
 ```
 
-which exercises GDAL, PROJ, shapely, pyogrio, RAW (rawpy), the tile server,
-logo, and license, and writes `RESULT: OK` (exit code 0) to `smoke.txt`.
+which exercises GDAL, PROJ, shapely, pyogrio, the tile server, logo, and
+license, and writes `RESULT: OK` (exit code 0) to `smoke.txt`.
 
 The `onedir` folder build (~270 MB) is the one to ship; wrap it with an
 installer such as Inno Setup. Target machines need Windows 10/11 with the

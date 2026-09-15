@@ -34,8 +34,17 @@ from rasterio.enums import Resampling
 from rasterio.vrt import WarpedVRT
 from rasterio.windows import Window
 
-RASTER_EXTS = (".tif", ".tiff", ".png", ".jpg", ".jpeg")
-RAW_EXTS = (".cr2", ".cr3", ".nef", ".arw", ".dng", ".raf", ".rw2", ".orf", ".pef")
+GEOTIFF_EXTS = (".tif", ".tiff")
+
+# Canopeo Drone is for georeferenced orthomosaics only. Plain photos belong in
+# Canopeo Drag&Drop, so anything without coordinates is rejected at load.
+NOT_GEOTIFF_MSG = (
+    "Canopeo Drone works with georeferenced GeoTIFF orthomosaics (.tif). "
+    "For regular photos (JPEG, PNG, camera RAW), use Canopeo Drag&Drop.")
+NO_CRS_MSG = (
+    "This GeoTIFF has no coordinate system, so it cannot be placed on the map. "
+    "Canopeo Drone needs a georeferenced orthomosaic; for plain images use "
+    "Canopeo Drag&Drop.")
 
 # Zero-based (R, G, B) positions per known multispectral sensor (by band count).
 SENSOR_PRESETS = {
@@ -158,7 +167,6 @@ class Session:
     ov_rgb: np.ndarray                    # (H,W,3) uint8 display overview
     ov_valid: np.ndarray                  # (H,W) bool
     bounds: Optional[tuple]               # ((s,w),(n,e)) WGS84
-    raw_rgb: Optional[np.ndarray] = None  # full (H,W,3) uint8 for RAW files
     notes: list = field(default_factory=list)
 
     @property
@@ -167,10 +175,6 @@ class Session:
             return None
         (s, w), (n, e) = self.bounds
         return ((s + n) / 2, (w + e) / 2)
-
-
-def is_raw(path) -> bool:
-    return os.path.splitext(path)[1].lower() in RAW_EXTS
 
 
 def _gsd_text(ds) -> Optional[str]:
@@ -188,58 +192,34 @@ def _gsd_text(ds) -> Optional[str]:
 
 
 def open_session(path: str, max_dim: int = 1400) -> Session:
-    """Open a GeoTIFF / PNG / JPEG (or RAW if rawpy is installed)."""
+    """Open a georeferenced GeoTIFF orthomosaic. Rejects anything else."""
     name = os.path.basename(path)
+    if os.path.splitext(path)[1].lower() not in GEOTIFF_EXTS:
+        raise RuntimeError(NOT_GEOTIFF_MSG)
     file_mb = os.path.getsize(path) / 1e6
 
-    if is_raw(path):
-        try:
-            import rawpy  # optional; deliberately not a hard dependency
-        except ImportError:
-            raise RuntimeError(
-                "RAW camera files need the optional 'rawpy' package "
-                "(pip install rawpy). GeoTIFF, PNG and JPEG work without it.")
-        with rawpy.imread(path) as raw:
-            rgb = raw.postprocess(no_auto_bright=True, output_bps=8)
-        h, w = rgb.shape[:2]
-        step = max(1, int(np.ceil(max(w, h) / max_dim)))
-        ov = np.ascontiguousarray(rgb[::step, ::step])
-        return Session(path, name, False, None, w, h, 3, "uint8", (0, 1, 2),
-                       Scaling(np.zeros(3), np.full(3, 255.0), True), file_mb,
-                       None, False, None, ov, np.ones(ov.shape[:2], bool),
-                       None, raw_rgb=rgb,
-                       notes=["RAW photo decoded; not georeferenced."])
-
     with rasterio.open(path) as ds:
+        if ds.crs is None:
+            raise RuntimeError(NO_CRS_MSG)
         rgb_idx = detect_rgb_indices(ds)
         scaling = compute_scaling(ds, rgb_idx)
         bands = tuple(i + 1 for i in rgb_idx)
-        geo = ds.crs is not None
         notes = []
         if ds.count < 3:
             notes.append("Fewer than 3 bands: canopy classification needs RGB.")
-        if not geo:
-            notes.append("Not georeferenced: whole-image cover only, no map or areas.")
 
-        if geo:
-            with WarpedVRT(ds, crs="EPSG:4326", resampling=Resampling.nearest) as vrt:
-                sc = min(1.0, max_dim / max(vrt.width, vrt.height))
-                oh, ow = max(1, int(vrt.height * sc)), max(1, int(vrt.width * sc))
-                chw = vrt.read(bands, out_shape=(3, oh, ow))
-                valid = _validity(vrt, chw, out_shape=(oh, ow))
-                b = vrt.bounds
-                bounds = ((b.bottom, b.left), (b.top, b.right))
-        else:
-            sc = min(1.0, max_dim / max(ds.width, ds.height))
-            oh, ow = max(1, int(ds.height * sc)), max(1, int(ds.width * sc))
-            chw = ds.read(bands, out_shape=(3, oh, ow))
-            valid = _validity(ds, chw, out_shape=(oh, ow))
-            bounds = None
+        with WarpedVRT(ds, crs="EPSG:4326", resampling=Resampling.nearest) as vrt:
+            sc = min(1.0, max_dim / max(vrt.width, vrt.height))
+            oh, ow = max(1, int(vrt.height * sc)), max(1, int(vrt.width * sc))
+            chw = vrt.read(bands, out_shape=(3, oh, ow))
+            valid = _validity(vrt, chw, out_shape=(oh, ow))
+            b = vrt.bounds
+            bounds = ((b.bottom, b.left), (b.top, b.right))
 
         ov_rgb = np.ascontiguousarray(np.transpose(scaling.apply(chw), (1, 2, 0)))
-        projected = bool(geo and ds.crs.is_projected)
+        projected = bool(ds.crs.is_projected)
         px_area = abs(ds.res[0] * ds.res[1]) if projected else None
-        return Session(path, name, geo, ds.crs.to_string() if geo else None,
+        return Session(path, name, True, ds.crs.to_string(),
                        ds.width, ds.height, ds.count, ds.dtypes[0], rgb_idx,
                        scaling, file_mb, _gsd_text(ds), projected, px_area,
                        ov_rgb, valid, bounds, notes=notes)
@@ -269,27 +249,75 @@ def _iter_strips(ds, strip_rows=1024):
         yield Window(0, row0, ds.width, h)
 
 
-def full_cover(s: Session, p: Params, progress=None) -> dict:
-    """Whole-image cover at full resolution. progress(fraction) optional."""
-    if s.raw_rgb is not None:
-        rgb = s.raw_rgb
-        m = canopeo_mask(rgb[..., 0], rgb[..., 1], rgb[..., 2], p)
-        g, v = int(m.sum()), int(m.size)
-        return {"cover": g / v * 100.0 if v else 0.0, "green_px": g, "valid_px": v}
+def _count_strip(ds, win, bands, scaling, p):
+    """(green, valid) pixel counts for one row strip."""
+    chw = ds.read(bands, window=win)
+    vmask = _validity(ds, chw, window=win)
+    rgb8 = scaling.apply(chw)
+    m = canopeo_mask(rgb8[0], rgb8[1], rgb8[2], p) & vmask
+    return int(m.sum()), int(vmask.sum())
+
+
+def _cover_worker(path, wins, bands, scaling, p, tick):
+    """Process a subset of strips on its own dataset handle. GDAL datasets are
+    not thread-safe to share, so each worker opens the file independently; the
+    reads (GDAL) and numpy work then run in parallel across cores."""
+    green = valid = 0
+    with rasterio.open(path) as ds:
+        for win in wins:
+            g, v = _count_strip(ds, win, bands, scaling, p)
+            green += g
+            valid += v
+            tick()
+    return green, valid
+
+
+def full_cover(s: Session, p: Params, progress=None, workers: int = None) -> dict:
+    """Whole-image cover at full resolution. progress(fraction) optional.
+
+    The raster is read in row strips spread across worker threads. GDAL
+    releases the GIL during reads and numpy during the vectorized
+    classification, so on a multi-core machine the decompress + classify work
+    overlaps and the pass runs roughly N× faster (bounded by disk/decode)."""
+    import concurrent.futures as cf
+    import threading
 
     bands = tuple(i + 1 for i in s.rgb_idx)
-    green = valid = 0
     with rasterio.open(s.path) as ds:
-        n = max(1, -(-ds.height // 1024))
-        for k, win in enumerate(_iter_strips(ds)):
-            chw = ds.read(bands, window=win)
-            vmask = _validity(ds, chw, window=win)
-            rgb8 = s.scaling.apply(chw)
-            m = canopeo_mask(rgb8[0], rgb8[1], rgb8[2], p) & vmask
-            green += int(m.sum())
-            valid += int(vmask.sum())
-            if progress:
-                progress((k + 1) / n)
+        wins = list(_iter_strips(ds))
+    n = max(1, len(wins))
+    if workers is None:
+        workers = min(os.cpu_count() or 4, 8)
+    workers = max(1, min(workers, n))
+
+    lock = threading.Lock()
+    seen = [0]
+
+    def tick():
+        if progress:
+            with lock:
+                seen[0] += 1
+                progress(seen[0] / n)
+
+    green = valid = 0
+    if workers == 1:
+        with rasterio.open(s.path) as ds:
+            for win in wins:
+                g, v = _count_strip(ds, win, bands, s.scaling, p)
+                green += g
+                valid += v
+                tick()
+    else:
+        # round-robin so the shorter tail strip is spread, not piled on one worker
+        chunks = [wins[i::workers] for i in range(workers)]
+        with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = [ex.submit(_cover_worker, s.path, ch, bands, s.scaling, p, tick)
+                    for ch in chunks if ch]
+            for fut in cf.as_completed(futs):
+                g, v = fut.result()
+                green += g
+                valid += v
+
     out = {"cover": green / valid * 100.0 if valid else 0.0,
            "green_px": green, "valid_px": valid}
     if s.px_area_m2:
@@ -340,24 +368,7 @@ def zonal_cover(s: Session, geojson_path: str, p: Params) -> tuple:
 # ── Exports ─────────────────────────────────────────────────────────────────
 
 def save_mask(s: Session, p: Params, out_path: str) -> str:
-    """Binary canopy mask: GeoTIFF (1=canopy, 0=other, 255=nodata) or PNG."""
-    from PIL import Image
-    if s.raw_rgb is not None or not s.georeferenced:
-        if s.raw_rgb is not None:
-            rgb = s.raw_rgb
-            m = canopeo_mask(rgb[..., 0], rgb[..., 1], rgb[..., 2], p)
-        else:
-            bands = tuple(i + 1 for i in s.rgb_idx)
-            with rasterio.open(s.path) as ds:
-                chw = ds.read(bands)
-                vmask = _validity(ds, chw)
-            rgb8 = s.scaling.apply(chw)
-            m = canopeo_mask(rgb8[0], rgb8[1], rgb8[2], p) & vmask
-        if not out_path.lower().endswith(".png"):
-            out_path += ".png"
-        Image.fromarray((m * 255).astype(np.uint8), "L").save(out_path)
-        return out_path
-
+    """Binary canopy mask as a GeoTIFF (1=canopy, 0=other, 255=nodata)."""
     if not out_path.lower().endswith((".tif", ".tiff")):
         out_path += ".tif"
     bands = tuple(i + 1 for i in s.rgb_idx)

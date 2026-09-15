@@ -76,6 +76,7 @@ preview_cc  = gui.state(None)        # % from the display overview
 full        = gui.state(None)        # dict from engine.full_cover
 full_prog   = gui.state(0.0)
 full_pending = gui.state(False)      # thresholds changed while computing
+stale       = gui.state(False)       # classification changed since last Recompute
 tile_url    = gui.state("")          # current tile template (changes with params)
 
 # Areas: drawn shapes and file plots in one list. Each entry is what guile's
@@ -211,23 +212,39 @@ def _tiles_update(new_source=False):
         gui.notify(f"Tile server error: {exc}", variant="warning")
 
 
-def on_param_change():
+def _refresh_display():
+    """Cheap update: preview overview + map overlay tiles. No full-res pass."""
     refresh_preview()
     _tiles_update()
+
+
+def set_display_param(state, value):
+    """Blend / color: appearance only — never recompute the cover."""
+    state.set(value)
+    _refresh_display()
+
+
+def set_class_param(state, value):
+    """R/G, B/G, ExG: change the classification. Update the live preview and
+    overlay and mark the exact cover stale, but wait for Recompute."""
+    state.set(value)
+    _refresh_display()
+    stale.set(True)
+
+
+def recompute():
+    """Full-resolution cover + per-area covers for the current thresholds."""
+    stale.set(False)
     run_full()
     run_areas()
-
-
-def set_param(state, value):
-    state.set(value)
-    on_param_change()
 
 
 def reset_defaults():
     rg.set(DEF_RG)
     bg.set(DEF_BG)
     exg.set(DEF_EXG)
-    on_param_change()
+    _refresh_display()
+    recompute()
 
 
 def load_image(path):
@@ -242,6 +259,7 @@ def load_image(path):
         sess.set(s)
         full.set(None)
         full_pending.set(False)
+        stale.set(False)
         sel_area.set(None)
         refresh_preview()
         _tiles_update(new_source=True)
@@ -250,11 +268,7 @@ def load_image(path):
         for n in s.notes:
             gui.notify(n, variant="warning", duration=6)
         run_full()
-        if s.georeferenced:
-            run_areas()              # re-apply existing areas to the new image
-        else:
-            areas.update(lambda a: [dict(x, cover_pct=None, valid_px=0,
-                                         green_px=0) for x in a])
+        run_areas()                  # re-apply existing areas to the new image
 
     def fail(exc):
         gui.notify(str(exc), variant="danger", duration=8)
@@ -438,15 +452,28 @@ def cover_readout():
                 note += f"  ·  preview {preview_cc.value:.1f}%"
             gui.text(note, size="sm", muted=True, key="cc-load-note")
         return
-    if f is not None:
+    # Recomputing while an earlier value exists.
+    if busy_full.value and f is not None:
         gui.badge(f"{f['cover']:.2f}% canopy cover", variant="success",
                   style="font-size:16px;padding:6px 14px", key="cc-badge")
-        if busy_full.value:                       # recomputing after a change
-            gui.progress(int(full_prog.value * 100), key="cc-progress")
-            gui.text("Updating…", size="sm", muted=True, key="cc-updating")
-    elif preview_cc.value is not None:
+        gui.progress(int(full_prog.value * 100), key="cc-progress",
+                     style="height:8px;background:rgba(0,0,0,.14)")
+        gui.text("Recomputing…", size="sm", muted=True, key="cc-updating")
+        return
+    # Exact value, up to date.
+    if f is not None and not stale.value:
+        gui.badge(f"{f['cover']:.2f}% canopy cover", variant="success",
+                  style="font-size:16px;padding:6px 14px", key="cc-badge")
+        return
+    # Thresholds changed (or no exact value yet): quick preview + Recompute.
+    if preview_cc.value is not None:
         gui.badge(f"{preview_cc.value:.1f}% (preview)", variant="neutral",
                   style="font-size:16px;padding:6px 14px", key="cc-badge")
+    gui.button("Recompute", variant="primary", size="sm", on_click=recompute,
+               key="cc-recompute")
+    gui.text("Recompute runs a full-resolution analysis for the exact value; "
+             "moving the sliders shows a quick preview approximation.",
+             size="sm", muted=True, key="cc-note")
 
 
 def metadata_block(s):
@@ -456,10 +483,7 @@ def metadata_block(s):
                  f"{s.file_mb:.1f} MB", size="sm", muted=True)
         r, g, b = (i + 1 for i in s.rgb_idx)
         gui.text(f"RGB from bands {r}/{g}/{b}", size="sm", muted=True)
-        if s.georeferenced:
-            gui.text(f"CRS {s.crs} · GSD {s.gsd}", size="sm", muted=True)
-        else:
-            gui.text("Not georeferenced", size="sm", muted=True)
+        gui.text(f"CRS {s.crs} · GSD {s.gsd}", size="sm", muted=True)
         f = full.value
         if f is not None:
             area = f" · {f['valid_m2'] / 1e4:.2f} ha" if "valid_m2" in f else ""
@@ -474,11 +498,11 @@ def analyze_tab():
         gui.button("Reset", variant="ghost", size="sm", on_click=reset_defaults,
                    key="reset-thr")
     gui.slider("R/G threshold", min=0.85, max=1.15, step=0.01, value=rg,
-               on_change=lambda v: set_param(rg, v), key="rg")
+               on_change=lambda v: set_class_param(rg, v), key="rg")
     gui.slider("B/G threshold", min=0.85, max=1.15, step=0.01, value=bg,
-               on_change=lambda v: set_param(bg, v), key="bg")
+               on_change=lambda v: set_class_param(bg, v), key="bg")
     gui.slider("Excess green (2G−R−B)", min=0, max=50, step=1, value=exg,
-               on_change=lambda v: set_param(exg, v), key="exg")
+               on_change=lambda v: set_class_param(exg, v), key="exg")
     gui.text("Lower the ratios to be stricter about what counts as canopy. Raise "
              "excess green to reject soil, shadows, or JPEG green tint.",
              size="sm", muted=True)
@@ -486,11 +510,11 @@ def analyze_tab():
     gui.divider()
     gui.text("Display", bold=True, size="sm", muted=True, style=SECTION_CSS)
     gui.slider("Mask blend", min=0, max=100, step=5, value=blend,
-               on_change=lambda v: set_param(blend, v), key="blend")
+               on_change=lambda v: set_display_param(blend, v), key="blend")
     gui.checkbox("Show overlay", value=show_ovl, on_change=show_ovl.set,
                  key="show-ovl")
     gui.select(COLORS, "Mask color", value=color,
-               on_change=lambda v: set_param(color, v), key="color")
+               on_change=lambda v: set_display_param(color, v), key="color")
     if s is not None and s.georeferenced:
         gui.select(TILES, "Basemap", value=tiles, on_change=tiles.set, key="tiles")
 
@@ -510,6 +534,9 @@ def areas_tab():
         return
     if busy_areas.value:
         gui.text("Computing area cover…", size="sm", muted=True)
+    elif stale.value:
+        gui.text("Thresholds changed — press Recompute for exact area values.",
+                 size="sm", muted=True)
 
     sel = next((a for a in lst if a["id"] == sel_area.value), None)
     if sel is not None:
@@ -554,11 +581,10 @@ def export_tab():
     s = sess.value
     have = s is not None
     gui.text("Canopy mask", bold=True, size="sm")
-    gui.text("GeoTIFF for georeferenced images (1 = canopy, 0 = other, "
-             "255 = nodata); PNG otherwise. Uses the current thresholds.",
-             size="sm", muted=True)
-    ftype = ("tif",) if (have and s.georeferenced) else ("png",)
-    gui.file_picker("Save mask…", save=True, file_types=ftype, disabled=not have,
+    gui.text("GeoTIFF mask (1 = canopy, 0 = other, 255 = nodata) at the current "
+             "thresholds.", size="sm", muted=True)
+    gui.file_picker("Save mask…", save=True, file_types=("GeoTIFF (*.tif)",),
+                    disabled=not have,
                     on_change=export_mask, key="mask-save", style="width:100%")
     gui.divider()
     gui.text("Areas", bold=True, size="sm")
@@ -632,14 +658,19 @@ def modals():
         with gui.scroll(max_height=520):
             with gui.col(gap=10):
                 gui.text("Workflow", bold=True, size="sm")
-                gui.text("1. Load a GeoTIFF orthomosaic (RGB or multispectral) "
-                         "or a photo (PNG, JPEG, or camera RAW).", size="sm")
+                gui.text("1. Load a georeferenced GeoTIFF orthomosaic (RGB or "
+                         "multispectral). For plain photos, use Canopeo Drag&Drop.",
+                         size="sm")
                 gui.text("2. The map shows the classified image over satellite "
                          "imagery. Whole-image cover shows a quick preview first, "
                          "then the exact full-resolution value.", size="sm")
                 gui.text("3. Adjust the thresholds until the overlay matches the "
-                         "canopy you see. Every change recomputes all cover values "
-                         "automatically.", size="sm")
+                         "canopy you see. While you drag, the map overlay and the "
+                         "cover number update as a quick preview from a downscaled "
+                         "image. Press Recompute for the exact full-resolution "
+                         "value — on large orthomosaics that pass takes a few "
+                         "seconds, so it is a deliberate step, not automatic.",
+                         size="sm")
                 gui.text("4. Draw areas on the map or load a GeoJSON of plot "
                          "boundaries (Areas tab). Each area shows its cover on the "
                          "map and in the table. Save results from the Export tab.", size="sm")
@@ -683,8 +714,7 @@ def sidebar():
     with gui.col(padding=16, gap=12, style=SIDEBAR_CSS):
         gui.file_picker("Loading…" if busy_load.value else "Load image…",
                         value=img_pick,
-                        file_types=("tif", "tiff", "png", "jpg", "jpeg",
-                                    "Camera RAW (*.dng;*.cr2;*.cr3;*.nef;*.arw;*.raf;*.rw2;*.orf;*.pef)"),
+                        file_types=("GeoTIFF (*.tif;*.tiff)",),
                         disabled=busy_load.value, on_change=load_image,
                         key="img-load", style="width:100%")
         if sess.value is not None:
@@ -737,33 +767,26 @@ def main_view():
                 with gui.card(padding=40):
                     with gui.col(align="center", gap=8):
                         gui.text("No image loaded", muted=True)
-                        gui.text("Load a GeoTIFF orthomosaic or a photo (PNG, JPEG, RAW) to begin.",
+                        gui.text("Load a georeferenced GeoTIFF orthomosaic to begin.",
                                  muted=True, size="sm")
             return
 
-        if s.georeferenced:
-            layers = []
-            if show_ovl.value:
-                ov = _overlay_layer(s)
-                if ov is not None:
-                    layers.append(ov)
-            v = view.value
-            gui.leaflet(center=v["center"], zoom=v["zoom"], height=800,
-                        tiles=TILE_LAYERS[tiles.value], layers=layers,
-                        draw=["rectangle", "polygon", "circle"],
-                        drawn=_drawn_entries(), draw_style=AREA_STYLE,
-                        on_shape=on_shape, on_shape_edit=on_shape_edit,
-                        on_shape_delete=on_shape_delete,
-                        on_shape_click=on_shape_click,
-                        on_move=on_move,
-                        on_click=lambda lat, lon: sel_area.set(None),
-                        style="height:100%", key="map")
-        else:
-            b64 = base64.b64encode(preview_png.value or b"").decode()
-            with gui.col(padding=16, fill=True, align="center", justify="center"):
-                gui.html(f'<img src="data:image/png;base64,{b64}" '
-                         f'style="max-width:100%;max-height:calc({BODY_H} - 32px);'
-                         'object-fit:contain">', key="img-view")
+        layers = []
+        if show_ovl.value:
+            ov = _overlay_layer(s)
+            if ov is not None:
+                layers.append(ov)
+        v = view.value
+        gui.leaflet(center=v["center"], zoom=v["zoom"], height=800,
+                    tiles=TILE_LAYERS[tiles.value], layers=layers,
+                    draw=["rectangle", "polygon", "circle"],
+                    drawn=_drawn_entries(), draw_style=AREA_STYLE,
+                    on_shape=on_shape, on_shape_edit=on_shape_edit,
+                    on_shape_delete=on_shape_delete,
+                    on_shape_click=on_shape_click,
+                    on_move=on_move,
+                    on_click=lambda lat, lon: sel_area.set(None),
+                    style="height:100%", key="map")
 
 
 @gui.app("Canopeo Drone", width=1320, height=880, resizable=True)
@@ -790,11 +813,30 @@ def _smoke(log_path: str) -> int:
         lines.append(f"rasterio {rasterio.__version__} (GDAL {rasterio.__gdal_version__}), "
                      f"pyproj {pyproj.__version__} (PROJ {pyproj.proj_version_str}), "
                      f"shapely {shapely.__version__}, geopandas {geopandas.__version__}")
-        demo = os.path.join(ROOT_DIR, "demo")
-        s = E.open_session(os.path.join(demo, "demo_1.jpg"))
+        # synthesize a small georeferenced GeoTIFF — no fixture ships with the app
+        import json as _json, tempfile
+        import numpy as _np
+        from rasterio.transform import from_origin
+        _tif = os.path.join(tempfile.gettempdir(), "canopeo_smoke.tif")
+        _h, _w = 240, 320
+        _rgb = _np.zeros((3, _h, _w), _np.uint8)
+        _rgb[0] = 120; _rgb[1] = 110; _rgb[2] = 115            # soil
+        _rgb[0, :120] = 40; _rgb[1, :120] = 200; _rgb[2, :120] = 45  # top half green
+        with rasterio.open(_tif, "w", driver="GTiff", height=_h, width=_w, count=3,
+                           dtype="uint8", crs="EPSG:32614",
+                           transform=from_origin(563000, 4252000, 3, 3),
+                           photometric="RGB") as _ds:
+            _ds.write(_rgb)
+        s = E.open_session(_tif)
         r = E.full_cover(s, E.Params())
-        lines.append(f"demo_1.jpg cover {r['cover']:.2f}% (expect ~41.26)")
-        ok &= abs(r["cover"] - 41.26) < 0.05
+        lines.append(f"GeoTIFF cover {r['cover']:.1f}% (expect ~50), CRS {s.crs}")
+        ok &= abs(r["cover"] - 50.0) < 2.0 and s.georeferenced
+        # a non-GeoTIFF input must be refused
+        try:
+            E.open_session(_tif[:-4] + ".jpg")
+            lines.append("reject non-GeoTIFF: NOT rejected"); ok = False
+        except RuntimeError:
+            lines.append("reject non-GeoTIFF: ok")
         # projected CRS round-trip through PROJ (needs proj.db)
         from pyproj import Transformer
         x, y = Transformer.from_crs("EPSG:4326", "EPSG:32614", always_xy=True).transform(-98.0, 38.3)
@@ -802,27 +844,23 @@ def _smoke(log_path: str) -> int:
         ok &= 500000 < x < 600000
         geom = E.shape_geometry_wgs84({"type": "circle", "coords": {"lat": 38.3, "lng": -98.0, "radius": 100}})
         lines.append(f"circle geometry ok: {geom.geom_type}, {len(geom.exterior.coords)} pts")
-        # verify pyogrio can read a GeoJSON (the frozen-build failure mode);
-        # synthesize one in a temp file so no fixture ships with the app
-        import json as _json, tempfile
+        # verify pyogrio can read a GeoJSON (the frozen-build failure mode)
         _fc = {"type": "FeatureCollection", "features": [
             {"type": "Feature", "properties": {"plot_id": f"p{_i}"},
              "geometry": {"type": "Polygon", "coordinates": [[
                  [-98.00, 38.30], [-97.99, 38.30], [-97.99, 38.31],
                  [-98.00, 38.31], [-98.00, 38.30]]]}} for _i in range(2)]}
-        _tmp = os.path.join(tempfile.gettempdir(), "canopeo_smoke.geojson")
-        with open(_tmp, "w", encoding="utf-8") as _f:
+        _gj = os.path.join(tempfile.gettempdir(), "canopeo_smoke.geojson")
+        with open(_gj, "w", encoding="utf-8") as _f:
             _json.dump(_fc, _f)
-        shapes = E.import_geojson_shapes(_tmp)
-        os.remove(_tmp)
+        shapes = E.import_geojson_shapes(_gj)
         lines.append(f"GeoJSON read (pyogrio): {len(shapes)} polygons")
         ok &= len(shapes) == 2
-        try:
-            import rawpy
-            lines.append(f"RAW support (rawpy): {rawpy.__version__}")
-        except Exception as _e:
-            lines.append(f"RAW support (rawpy): MISSING ({_e})")
-            ok = False
+        for _f in (_tif, _gj):
+            try:
+                os.remove(_f)
+            except OSError:
+                pass
         lines.append("tile server: " + ("started" if TILESERVER else "unavailable"))
         ok &= TILESERVER is not None
         lines.append("logo: " + ("found" if LOGO_SRC else "MISSING"))

@@ -14,8 +14,7 @@ geospatial app needs on top:
   * the GDAL and PROJ data directories (proj.db etc.),
   * a full collect of rasterio / pyproj / pyogrio, whose compiled submodules
     and data PyInstaller's static analysis misses,
-  * the icon, license and demo image used by the packaged self-test
-    (CanopeoDrone.exe --smoke log.txt),
+  * the icon and license (the self-test synthesizes its own GeoTIFF),
   * excludes for the heavy optional stacks (TensorFlow, dask, numba, OpenCV,
     ...) that pandas/geopandas/rasterio extras would otherwise pull in from a
     full environment. Building from a clean venv makes these unnecessary; they
@@ -33,7 +32,7 @@ APP = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(APP)
 NAME = "CanopeoDrone"
 
-# Optional stacks reachable through pandas/geopandas/rasterio/rawpy extras
+# Optional stacks reachable through pandas/geopandas/rasterio extras
 # that the app never uses. (guile already excludes IPython/sphinx/docutils/…)
 HEAVY_EXCLUDES = [
     "tensorflow", "tensorboard", "keras", "huggingface_hub", "torch",
@@ -75,7 +74,6 @@ def main():
         (os.path.join(ROOT, "assets", "kstate_logo.jpg"), "assets"),
         (os.path.join(ROOT, "assets", "osu_logo.png"), "assets"),
         (os.path.join(ROOT, "LICENSE.txt"), "."),
-        (os.path.join(ROOT, "demo", "demo_1.jpg"), "demo"),
         (gdal, "gdal_data"),
         (proj, "proj_data"),
     ]
@@ -85,7 +83,7 @@ def main():
         windowed=not console,
         icon=os.path.join(ROOT, "icons", "canopeo.ico"),
         add_data=add_data,
-        hidden_imports=["engine", "tileserver", "rawpy", "pyogrio"],
+        hidden_imports=["engine", "tileserver", "pyogrio"],
         exclude_modules=HEAVY_EXCLUDES,
         output_dir=os.path.join(ROOT, "dist"),
         run=False,

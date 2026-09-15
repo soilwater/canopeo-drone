@@ -13,7 +13,6 @@ shapely==2.1.2
 pyproj==3.6.1
 pyogrio==0.9.0
 pandas==2.3.3
-rawpy==0.27.1
 pywebview==6.2.1
 pythonnet==3.0.5
 clr-loader==0.2.10

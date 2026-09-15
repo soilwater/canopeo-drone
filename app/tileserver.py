@@ -204,7 +204,7 @@ class CanopeoTileServer:
         old, self._source = self._source, None
         if old is not None:
             old.close()
-        if session is not None and session.georeferenced and session.raw_rgb is None:
+        if session is not None and session.georeferenced:
             self._source = _Source(session)
         self.set_params(params)
 
