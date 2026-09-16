@@ -1,7 +1,7 @@
 """
 Canopeo Drone — green canopy cover for drone & satellite imagery.
 
-Desktop app built with guile (>= 0.8.4). Sidebar holds the controls; the
+Desktop app built with guile (>= 0.8.7). Sidebar holds the controls; the
 map with the classified orthomosaic draped over satellite imagery is the
 main view. Areas of interest (drawn on the map or loaded from GeoJSON)
 get their own canopy cover.
@@ -42,7 +42,7 @@ if FROZEN:
 sys.path.insert(0, APP_DIR)
 import engine as E  # noqa: E402
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 HOMEPAGE = "https://soilwater.github.io/canopeo-drone/"
 
 # ── TILESERVER (optional) ───────────────────────────────────────────────────
@@ -86,7 +86,7 @@ sel_area    = gui.state(None)        # id of the selected area
 areas_pending = gui.state(False)
 _area_seq   = [0]
 
-tiles       = gui.state("satellite")
+tiles       = gui.state("none")      # default: no basemap (drone > basemap res)
 view        = gui.state({"center": (39.19, -96.58), "zoom": 5})
 img_pick    = gui.state("")          # kept empty so the button label stays fixed
 plots_pick  = gui.state("")
@@ -97,8 +97,7 @@ show_guide  = gui.state(False)
 
 COLORS = [("#00ff00", "Green"), ("#ffffff", "White"), ("#f6ff00", "Yellow"),
           ("#00ffff", "Cyan"), ("#ff007f", "Magenta")]
-TILES = [("satellite", "Satellite"), ("hybrid", "Satellite + labels"),
-         ("street", "Street"), ("terrain", "Terrain")]
+TILES = [("none", "None"), ("satellite", "Satellite")]
 
 NEON = "#39ff14"
 AREA_STYLE = {"color": NEON, "weight": 3, "opacity": 1.0,
@@ -120,17 +119,19 @@ def _tile(url, native, attribution, **extra):
     return {"url": url, "options": opts}
 
 
+# Satellite imagery from Esri's arcgisonline CDN, which permits app use.
+# (OpenStreetMap / OpenTopoMap are volunteer-run servers that return HTTP 403
+# to apps, so they are not used.) "none" is a 1x1 transparent tile: no basemap
+# imagery, but the map still pans, zooms, and places the overlay by coordinate.
+_TRANSPARENT = ("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAf"
+                "FcSJAAAADUlEQVR4nGNgYGBgAAAABQABpfZFQAAAAABJRU5ErkJggg==")
+
 TILE_LAYERS = {
     "satellite": [_tile(_ESRI + "World_Imagery/MapServer/tile/{z}/{y}/{x}",
                         19, "Tiles © Esri")],
-    "hybrid": [_tile(_ESRI + "World_Imagery/MapServer/tile/{z}/{y}/{x}",
-                     19, "Tiles © Esri"),
-               _tile(_ESRI + "Reference/World_Boundaries_and_Places/MapServer/"
-                     "tile/{z}/{y}/{x}", 19, "")],
-    "street": [_tile("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
-                     19, "© OpenStreetMap contributors")],
-    "terrain": [_tile("https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
-                      17, "© OpenStreetMap, SRTM | © OpenTopoMap")],
+    "none": [{"url": _TRANSPARENT,
+              "options": {"attribution": "", "maxNativeZoom": MAX_ZOOM,
+                          "maxZoom": MAX_ZOOM}}],
 }
 
 
