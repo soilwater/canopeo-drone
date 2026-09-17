@@ -1,7 +1,7 @@
 """
 Canopeo Drone — green canopy cover for drone & satellite imagery.
 
-Desktop app built with guile (>= 0.8.7). Sidebar holds the controls; the
+Desktop app built with guile (>= 0.8.9). Sidebar holds the controls; the
 map with the classified orthomosaic draped over satellite imagery is the
 main view. Areas of interest (drawn on the map or loaded from GeoJSON)
 get their own canopy cover.
@@ -11,6 +11,7 @@ Run:
 """
 
 import base64
+import html
 import math
 import os
 import sys
@@ -42,7 +43,7 @@ if FROZEN:
 sys.path.insert(0, APP_DIR)
 import engine as E  # noqa: E402
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 HOMEPAGE = "https://soilwater.github.io/canopeo-drone/"
 
 # ── TILESERVER (optional) ───────────────────────────────────────────────────
@@ -444,6 +445,43 @@ SECTION_CSS = "text-transform:uppercase;letter-spacing:.06em"
 # square map corners; let the map fill its column instead of a fixed height
 PAGE_CSS = ("<style>.guile-map{border-radius:0 !important;height:100% !important}"
             ".guile-map-canvas{height:100% !important}</style>")
+ACCENT = "#15803d"           # Canopeo green: buttons, sliders, links, results
+PANEL_CSS = "background:var(--surface-2);box-shadow:none;border:1px solid var(--border)"
+LOAD_BTN_CSS = "width:100%;background:var(--primary);color:#fff;border-color:transparent"
+_CAPTION = ("font-size:10.5px;font-weight:600;letter-spacing:.07em;"
+            "text-transform:uppercase;color:var(--text-2)")
+_NUM = "font-variant-numeric:tabular-nums"
+
+
+def _fmt_area(m2) -> str:
+    """Ground area for display: m² for plots, hectares for fields."""
+    if not m2:
+        return "–"
+    return f"{m2 / 1e4:,.2f} ha" if m2 >= 1000 else f"{m2:,.1f} m²"
+
+
+def _kv_html(pairs) -> str:
+    """Two-column label / value grid (labels muted, values right-aligned)."""
+    cells = "".join(
+        f'<span style="color:var(--text-2)">{html.escape(str(k))}</span>'
+        f'<span style="text-align:right;{_NUM};overflow:hidden;'
+        f'text-overflow:ellipsis;white-space:nowrap">{html.escape(str(v))}</span>'
+        for k, v in pairs)
+    return ('<div style="display:grid;grid-template-columns:auto minmax(0,1fr);'
+            f'gap:4px 12px;font-size:12px;line-height:1.35">{cells}</div>')
+
+
+def _stat_html(value: str, caption: str, note: str = "", exact: bool = True) -> str:
+    """Headline number with a small caption; muted when it is only a preview."""
+    color = "var(--primary)" if exact else "var(--text-2)"
+    note_html = (f'<span style="font-size:11px;color:var(--text-2)">'
+                 f'{html.escape(note)}</span>') if note else ""
+    return ('<div style="display:flex;align-items:flex-end;justify-content:'
+            'space-between;gap:8px">'
+            f'<div><div style="{_CAPTION}">{html.escape(caption)}</div>'
+            f'<div style="font-size:30px;font-weight:700;line-height:1.15;'
+            f'letter-spacing:-.02em;color:{color};{_NUM}">{html.escape(value)}</div>'
+            f'</div>{note_html}</div>')
 
 
 def cover_readout():
@@ -457,8 +495,7 @@ def cover_readout():
     # slot the cover banner will occupy, so the flow reads load → analyzing → value.
     if f is None and busy_full.value:
         pct = int(full_prog.value * 100)
-        with gui.card(gap=6, padding=10, style="background:var(--surface-2)",
-                      key="cc-loading"):
+        with gui.card(gap=6, padding=12, style=PANEL_CSS, key="cc-loading"):
             gui.text("Analyzing full resolution…", bold=True, size="sm",
                      key="cc-load-title")
             # Slightly taller, darker track so the bar reads as a bar at 0%.
@@ -471,40 +508,48 @@ def cover_readout():
         return
     # Recomputing while an earlier value exists.
     if busy_full.value and f is not None:
-        gui.badge(f"{f['cover']:.2f}% canopy cover", variant="success",
-                  style="font-size:16px;padding:6px 14px", key="cc-badge")
-        gui.progress(int(full_prog.value * 100), key="cc-progress",
-                     style="height:8px;background:rgba(0,0,0,.14)")
-        gui.text("Recomputing…", size="sm", muted=True, key="cc-updating")
+        with gui.card(gap=8, padding=12, style=PANEL_CSS, key="cc-card"):
+            gui.html(_stat_html(f"{f['cover']:.2f}%", "Canopy cover",
+                                "recomputing…", exact=False), key="cc-stat")
+            gui.progress(int(full_prog.value * 100), key="cc-progress",
+                         style="height:6px;background:rgba(0,0,0,.14)")
         return
     # Exact value, up to date.
     if f is not None and not stale.value:
-        gui.badge(f"{f['cover']:.2f}% canopy cover", variant="success",
-                  style="font-size:16px;padding:6px 14px", key="cc-badge")
+        with gui.card(gap=8, padding=12, style=PANEL_CSS, key="cc-card"):
+            gui.html(_stat_html(f"{f['cover']:.2f}%", "Canopy cover",
+                                "full resolution"), key="cc-stat")
         return
     # Thresholds changed (or no exact value yet): quick preview + Recompute.
-    if preview_cc.value is not None:
-        gui.badge(f"{preview_cc.value:.1f}% (preview)", variant="neutral",
-                  style="font-size:16px;padding:6px 14px", key="cc-badge")
-    gui.button("Recompute", variant="primary", size="sm", on_click=recompute,
-               key="cc-recompute")
-    gui.text("Recompute runs a full-resolution analysis for the exact value; "
-             "moving the sliders shows a quick preview approximation.",
-             size="sm", muted=True, key="cc-note")
+    with gui.card(gap=8, padding=12, style=PANEL_CSS, key="cc-card"):
+        if preview_cc.value is not None:
+            gui.html(_stat_html(f"≈ {preview_cc.value:.1f}%", "Canopy cover",
+                                "preview", exact=False), key="cc-stat")
+        gui.button("Recompute", variant="primary", size="sm", on_click=recompute,
+                   key="cc-recompute", style="width:100%")
+        gui.text("Thresholds changed. Recompute for the exact full-resolution "
+                 "value.", size="sm", muted=True, key="cc-note")
 
 
 def metadata_block(s):
-    with gui.card(gap=3, padding=10, style="background:var(--surface-2)"):
-        gui.text(s.name, size="sm", bold=True, style="word-break:break-all")
-        gui.text(f"{s.width} × {s.height} px · {s.bands} band(s) · {s.dtype} · "
-                 f"{s.file_mb:.1f} MB", size="sm", muted=True)
-        r, g, b = (i + 1 for i in s.rgb_idx)
-        gui.text(f"RGB from bands {r}/{g}/{b}", size="sm", muted=True)
-        gui.text(f"CRS {s.crs} · GSD {s.gsd}", size="sm", muted=True)
-        f = full.value
-        if f is not None:
-            area = f" · {f['valid_m2'] / 1e4:.2f} ha" if "valid_m2" in f else ""
-            gui.text(f"Valid pixels {f['valid_px']:,}{area}", size="sm", muted=True)
+    size_mb = (f"{s.file_mb / 1000:.2f} GB" if s.file_mb >= 1000
+               else f"{s.file_mb:.1f} MB")
+    r, g, b = (i + 1 for i in s.rgb_idx)
+    pairs = [("Dimensions", f"{s.width:,} × {s.height:,} px"),
+             ("Pixel size", s.gsd),
+             ("CRS", s.crs),
+             ("File size", size_mb)]
+    if s.bands != 3 or (r, g, b) != (1, 2, 3):      # only when not plain RGB
+        pairs.insert(2, ("Bands", f"{s.bands} · RGB = {r}/{g}/{b}"))
+    f = full.value
+    if f is not None and "valid_m2" in f:
+        pairs.append(("Imaged area", _fmt_area(f["valid_m2"])))
+    name = html.escape(s.name)
+    with gui.card(gap=8, padding=12, style=PANEL_CSS):
+        gui.html(f'<div title="{name}" style="font-size:13px;font-weight:600;'
+                 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'
+                 f'{name}</div>', key="meta-name")
+        gui.html(_kv_html(pairs), key="meta-grid")
 
 
 def analyze_tab():
@@ -538,10 +583,8 @@ def analyze_tab():
 
 def areas_tab():
     geo = sess.value is not None
-    gui.text("Draw rectangles, polygons, or circles with the map toolbar, or "
-             "load a GeoJSON of plot boundaries. Each area gets its own canopy "
-             "cover. Edit or delete areas with the toolbar.",
-             size="sm", muted=True)
+    gui.text("Draw areas with the map toolbar or load plot boundaries. Each "
+             "area gets its own canopy cover.", size="sm", muted=True)
     gui.file_picker("Load plots (GeoJSON)…", value=plots_pick,
                     file_types=("geojson", "json"), disabled=not geo,
                     on_change=load_plots, key="plots-load", style="width:100%")
@@ -556,7 +599,7 @@ def areas_tab():
 
     sel = next((a for a in lst if a["id"] == sel_area.value), None)
     if sel is not None:
-        with gui.card(gap=4, padding=10, style="background:var(--surface-2)"):
+        with gui.card(gap=6, padding=12, style=PANEL_CSS):
             with gui.row(justify="space-between", align="center"):
                 gui.text(sel.get("name", sel["id"]), bold=True, size="sm")
                 with gui.row(gap=2):
@@ -566,30 +609,39 @@ def areas_tab():
                     gui.button("✕", variant="ghost", size="sm",
                                on_click=lambda: sel_area.set(None), key="sel-close")
             cc = sel.get("cover_pct")
-            gui.badge("n/a" if cc is None else f"{cc:.2f}% canopy cover",
-                      variant="success" if cc is not None else "neutral")
-            bits = [f"{sel['type']} · {sel.get('source', 'drawn')}"]
+            gui.html(_stat_html("–" if cc is None else f"{cc:.2f}%",
+                                "Canopy cover", exact=cc is not None),
+                     key="sel-stat")
+            pairs = [("Shape", f"{sel['type'].capitalize()} · "
+                               f"{sel.get('source', 'drawn')}")]
             if sel.get("area_m2"):
-                bits.append(f"{sel['area_m2'] / 1e4:.3f} ha")
+                pairs.append(("Area", _fmt_area(sel["area_m2"])))
             if sel.get("valid_px"):
-                bits.append(f"{sel['valid_px']:,} px")
-            gui.text(" · ".join(bits), size="sm", muted=True)
+                pairs.append(("Pixels", f"{sel['valid_px']:,}"))
+            gui.html(_kv_html(pairs), key="sel-grid")
 
     vals = [a["cover_pct"] for a in lst if a.get("cover_pct") is not None]
     with gui.row(justify="space-between", align="center"):
-        if vals:
-            gui.text(f"{len(lst)} areas · mean {sum(vals) / len(vals):.1f}% · "
-                     f"min {min(vals):.1f}% · max {max(vals):.1f}%",
-                     size="sm", muted=True)
-        else:
-            gui.text(f"{len(lst)} areas", size="sm", muted=True)
+        gui.text(f"{len(lst)} area{'s' if len(lst) != 1 else ''}", bold=True,
+                 size="sm", muted=True, style=SECTION_CSS)
         gui.button("Clear all", size="sm", variant="ghost", on_click=clear_areas,
                    key="areas-clear")
+    if len(vals) > 1:
+        stats = (("Mean", sum(vals) / len(vals)), ("Min", min(vals)),
+                 ("Max", max(vals)))
+        cells = "".join(
+            f'<div><div style="{_CAPTION}">{k}</div><div style="font-size:15px;'
+            f'font-weight:600;{_NUM}">{v:.1f}%</div></div>' for k, v in stats)
+        gui.html('<div style="display:grid;grid-template-columns:repeat(3,1fr);'
+                 f'gap:8px">{cells}</div>', key="areas-stats")
     rows = [{"area": a.get("name"),
-             "cover %": "…" if a.get("cover_pct") is None else a["cover_pct"],
-             "ha": round(a["area_m2"] / 1e4, 3) if a.get("area_m2") else ""}
+             "cover": "…" if a.get("cover_pct") is None else f"{a['cover_pct']:.2f}%",
+             "size": _fmt_area(a.get("area_m2"))}
             for a in lst]
-    with gui.scroll(max_height=380, key="areas-scroll"):
+    # flex:0 0 auto — gui.scroll fills leftover space (flex-basis 0), and in the
+    # fixed-height sidebar that leftover can be a sliver; size to content
+    # instead and let the sidebar scroll.
+    with gui.scroll(max_height=380, style="flex:0 0 auto", key="areas-scroll"):
         gui.table(rows, key="areas-table")
 
 
@@ -735,7 +787,7 @@ def sidebar():
                         value=img_pick,
                         file_types=("GeoTIFF (*.tif;*.tiff)",),
                         disabled=busy_load.value, on_change=load_image,
-                        key="img-load", style="width:100%")
+                        key="img-load", style=LOAD_BTN_CSS)
         if sess.value is not None:
             metadata_block(sess.value)
             cover_readout()
@@ -810,6 +862,7 @@ def main_view():
 
 @gui.app("Canopeo Drone", width=1320, height=880, resizable=True)
 def ui():
+    gui.theme("light", primary=ACCENT, key="theme")
     with gui.col(gap=0, style="height:100vh;overflow:hidden"):
         gui.html(PAGE_CSS, key="page-css")
         toolbar()

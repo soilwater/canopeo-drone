@@ -16,8 +16,8 @@ Project page: https://soilwater.github.io/canopeo-drone/
   guile, and every library, so nothing needs to be installed. Windows 10/11
   already has the WebView2 runtime it uses.
 * **Running from source** needs Python 3.11+ and the packages in
-  `app/requirements.txt` (which installs `guile >= 0.8.7` from its repo).
-* **Building the installer** needs `guile >= 0.8.7` (see Packaging).
+  `app/requirements.txt` (which installs `guile >= 0.8.9` from its repo).
+* **Building the installer** needs `guile >= 0.8.9` (see Packaging).
 
 ## Repo layout
 
@@ -101,7 +101,7 @@ python app/build.py             # dist/CanopeoDrone/  (folder build, onedir)
 python app/build.py --console   # keep a console to see tracebacks
 ```
 
-`build.py` wraps `gui.package()` (PyInstaller). guile (>= 0.8.7) handles the
+`build.py` wraps `gui.package()` (PyInstaller). guile (>= 0.8.9) handles the
 generic hard parts — bundling only the native WebView2 backend, raising the
 recursion limit, and putting conda's `Library\bin` on PATH during the build.
 `build.py` adds the geospatial specifics: the GDAL / PROJ data directories, a
