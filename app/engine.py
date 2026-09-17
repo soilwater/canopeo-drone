@@ -6,14 +6,13 @@ imagery. Designed around three facts:
 
   * Orthomosaics can be multi-GB, so every full-resolution pass streams
     the raster in row strips and never loads it whole.
-  * Thresholds must behave the same everywhere in the image, so one global
-    2-98 percentile stretch (computed once from an overview) maps any bit
-    depth to 8-bit before classification. Per-tile stretching would move
-    the decision boundary across stitch seams.
+  * Canopeo was developed for standard 8-bit RGB images, so that is the only
+    pixel format accepted. Pixel values are classified exactly as stored;
+    nothing is rescaled or converted, and other formats are rejected at load.
   * Stitched borders / nodata must not count. Validity comes from the
     dataset mask (alpha / nodata / internal mask) plus an all-zero test.
 
-A Session caches the cheap things (metadata, scaling, a display overview
+A Session caches the cheap things (metadata, a display overview
 already reprojected to WGS84) so the UI can re-preview instantly; the
 expensive full-resolution numbers are separate calls meant for a
 background task.
@@ -24,7 +23,7 @@ from __future__ import annotations
 import io
 import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
@@ -45,12 +44,10 @@ NO_CRS_MSG = (
     "This GeoTIFF has no coordinate system, so it cannot be placed on the map. "
     "Canopeo Drone needs a georeferenced orthomosaic; for plain images use "
     "Canopeo Drag&Drop.")
-
-# Zero-based (R, G, B) positions per known multispectral sensor (by band count).
-SENSOR_PRESETS = {
-    8: (5, 3, 1),   # PlanetScope 8-band SR: Red=6, Green=4, Blue=2
-    5: (2, 1, 0),   # MicaSense 5-band: Red=3, Green=2, Blue=1
-}
+NOT_RGB8_MSG = (
+    "Canopeo Drone needs a standard 8-bit RGB orthomosaic (uint8, at least "
+    "3 bands). This file has {bands} band(s) of type {dtype}. Export the "
+    "orthomosaic from your photogrammetry software as 8-bit RGB.")
 
 
 @dataclass
@@ -86,34 +83,15 @@ def blend_rgb(rgb: np.ndarray, mask: np.ndarray, p: Params) -> np.ndarray:
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
-# ── Band mapping & scaling ──────────────────────────────────────────────────
+# ── Band mapping & validity ─────────────────────────────────────────────────
 
 def detect_rgb_indices(ds) -> tuple:
+    """Zero-based (R, G, B) band positions: the file's color tags when
+    present, else bands 1/2/3. Callers guarantee ds.count >= 3."""
     ci = [c.name for c in ds.colorinterp]
     if "red" in ci and "green" in ci and "blue" in ci:
         return ci.index("red"), ci.index("green"), ci.index("blue")
-    if ds.count in SENSOR_PRESETS:
-        return SENSOR_PRESETS[ds.count]
-    if ds.count >= 3:
-        return (0, 1, 2)
-    return (0, 0, 0)
-
-
-@dataclass
-class Scaling:
-    lo: np.ndarray
-    hi: np.ndarray
-    passthrough: bool = False
-
-    def apply(self, chw: np.ndarray) -> np.ndarray:
-        if self.passthrough:
-            return chw.astype(np.uint8)
-        out = np.empty(chw.shape, dtype=np.uint8)
-        for c in range(3):
-            span = max(float(self.hi[c] - self.lo[c]), 1e-6)
-            v = (chw[c].astype(np.float32) - self.lo[c]) * (255.0 / span)
-            out[c] = np.clip(v, 0, 255).astype(np.uint8)
-        return out
+    return (0, 1, 2)
 
 
 def _validity(ds, chw, window=None, out_shape=None) -> np.ndarray:
@@ -127,62 +105,41 @@ def _validity(ds, chw, window=None, out_shape=None) -> np.ndarray:
     return dm & ~np.all(chw == 0, axis=0)
 
 
-def compute_scaling(ds, rgb_idx, max_dim=1024) -> Scaling:
-    if ds.dtypes[0] == "uint8":
-        return Scaling(np.zeros(3), np.full(3, 255.0), passthrough=True)
-    sc = min(1.0, max_dim / max(ds.width, ds.height))
-    oh, ow = max(1, int(ds.height * sc)), max(1, int(ds.width * sc))
-    bands = tuple(i + 1 for i in rgb_idx)
-    ov = ds.read(bands, out_shape=(3, oh, ow)).astype(np.float32)
-    valid = _validity(ds, ov, out_shape=(oh, ow))
-    lo = np.zeros(3, np.float32)
-    hi = np.ones(3, np.float32)
-    for c in range(3):
-        vals = ov[c][valid]
-        if vals.size:
-            lo[c], hi[c] = np.percentile(vals, (2, 98))
-        if hi[c] <= lo[c]:
-            hi[c] = lo[c] + 1.0
-    return Scaling(lo, hi)
-
-
 # ── Session ─────────────────────────────────────────────────────────────────
 
 @dataclass
 class Session:
     path: str
     name: str
-    georeferenced: bool
-    crs: Optional[str]
+    crs: str
     width: int
     height: int
     bands: int
     dtype: str
     rgb_idx: tuple
-    scaling: Scaling
     file_mb: float
-    gsd: Optional[str]                    # ground sample distance text
-    projected: bool                       # CRS in meters (areas possible)
-    px_area_m2: Optional[float]
+    gsd: str                              # ground sample distance text
+    projected: bool                       # projected CRS (areas possible)
+    px_area_m2: Optional[float]           # None for geographic CRSs
     ov_rgb: np.ndarray                    # (H,W,3) uint8 display overview
     ov_valid: np.ndarray                  # (H,W) bool
-    bounds: Optional[tuple]               # ((s,w),(n,e)) WGS84
-    notes: list = field(default_factory=list)
+    bounds: tuple                         # ((s,w),(n,e)) WGS84
 
     @property
     def center(self):
-        if not self.bounds:
-            return None
         (s, w), (n, e) = self.bounds
         return ((s + n) / 2, (w + e) / 2)
 
 
-def _gsd_text(ds) -> Optional[str]:
-    if ds.crs is None:
-        return None
+def _unit_m(crs) -> float:
+    """Meters per CRS linear unit (1.0 for meters, 0.3048... for feet)."""
+    return float(crs.linear_units_factor[1])
+
+
+def _gsd_text(ds) -> str:
     rx, ry = ds.res
     if ds.crs.is_projected:
-        g = (abs(rx) + abs(ry)) / 2
+        g = (abs(rx) + abs(ry)) / 2 * _unit_m(ds.crs)
     else:
         lat = (ds.bounds.top + ds.bounds.bottom) / 2
         gx = abs(rx) * 111_320 * np.cos(np.radians(lat))
@@ -192,7 +149,7 @@ def _gsd_text(ds) -> Optional[str]:
 
 
 def open_session(path: str, max_dim: int = 1400) -> Session:
-    """Open a georeferenced GeoTIFF orthomosaic. Rejects anything else."""
+    """Open a georeferenced 8-bit RGB GeoTIFF orthomosaic. Rejects anything else."""
     name = os.path.basename(path)
     if os.path.splitext(path)[1].lower() not in GEOTIFF_EXTS:
         raise RuntimeError(NOT_GEOTIFF_MSG)
@@ -201,12 +158,11 @@ def open_session(path: str, max_dim: int = 1400) -> Session:
     with rasterio.open(path) as ds:
         if ds.crs is None:
             raise RuntimeError(NO_CRS_MSG)
+        if ds.count < 3 or any(dt != "uint8" for dt in ds.dtypes):
+            raise RuntimeError(NOT_RGB8_MSG.format(
+                bands=ds.count, dtype="/".join(sorted(set(ds.dtypes)))))
         rgb_idx = detect_rgb_indices(ds)
-        scaling = compute_scaling(ds, rgb_idx)
         bands = tuple(i + 1 for i in rgb_idx)
-        notes = []
-        if ds.count < 3:
-            notes.append("Fewer than 3 bands: canopy classification needs RGB.")
 
         with WarpedVRT(ds, crs="EPSG:4326", resampling=Resampling.nearest) as vrt:
             sc = min(1.0, max_dim / max(vrt.width, vrt.height))
@@ -216,13 +172,14 @@ def open_session(path: str, max_dim: int = 1400) -> Session:
             b = vrt.bounds
             bounds = ((b.bottom, b.left), (b.top, b.right))
 
-        ov_rgb = np.ascontiguousarray(np.transpose(scaling.apply(chw), (1, 2, 0)))
+        ov_rgb = np.ascontiguousarray(np.transpose(chw, (1, 2, 0)))
         projected = bool(ds.crs.is_projected)
-        px_area = abs(ds.res[0] * ds.res[1]) if projected else None
-        return Session(path, name, True, ds.crs.to_string(),
+        px_area = (abs(ds.res[0] * ds.res[1]) * _unit_m(ds.crs) ** 2
+                   if projected else None)
+        return Session(path, name, ds.crs.to_string(),
                        ds.width, ds.height, ds.count, ds.dtypes[0], rgb_idx,
-                       scaling, file_mb, _gsd_text(ds), projected, px_area,
-                       ov_rgb, valid, bounds, notes=notes)
+                       file_mb, _gsd_text(ds), projected, px_area,
+                       ov_rgb, valid, bounds)
 
 
 # ── Fast preview (overview) ─────────────────────────────────────────────────
@@ -243,29 +200,34 @@ def preview(s: Session, p: Params) -> tuple:
 
 # ── Full-resolution cover (streaming) ───────────────────────────────────────
 
-def _iter_strips(ds, strip_rows=1024):
+STRIP_PIXELS = 16_000_000     # per-strip budget; bounds memory on wide mosaics
+
+
+def _iter_strips(ds, strip_pixels=STRIP_PIXELS):
+    """Full-width row strips of about strip_pixels each (at most 1024 rows), so
+    peak memory per worker does not grow with the width of the mosaic."""
+    strip_rows = max(1, min(1024, strip_pixels // max(1, ds.width)))
     for row0 in range(0, ds.height, strip_rows):
         h = min(strip_rows, ds.height - row0)
         yield Window(0, row0, ds.width, h)
 
 
-def _count_strip(ds, win, bands, scaling, p):
+def _count_strip(ds, win, bands, p):
     """(green, valid) pixel counts for one row strip."""
     chw = ds.read(bands, window=win)
     vmask = _validity(ds, chw, window=win)
-    rgb8 = scaling.apply(chw)
-    m = canopeo_mask(rgb8[0], rgb8[1], rgb8[2], p) & vmask
+    m = canopeo_mask(chw[0], chw[1], chw[2], p) & vmask
     return int(m.sum()), int(vmask.sum())
 
 
-def _cover_worker(path, wins, bands, scaling, p, tick):
+def _cover_worker(path, wins, bands, p, tick):
     """Process a subset of strips on its own dataset handle. GDAL datasets are
     not thread-safe to share, so each worker opens the file independently; the
     reads (GDAL) and numpy work then run in parallel across cores."""
     green = valid = 0
     with rasterio.open(path) as ds:
         for win in wins:
-            g, v = _count_strip(ds, win, bands, scaling, p)
+            g, v = _count_strip(ds, win, bands, p)
             green += g
             valid += v
             tick()
@@ -303,7 +265,7 @@ def full_cover(s: Session, p: Params, progress=None, workers: int = None) -> dic
     if workers == 1:
         with rasterio.open(s.path) as ds:
             for win in wins:
-                g, v = _count_strip(ds, win, bands, s.scaling, p)
+                g, v = _count_strip(ds, win, bands, p)
                 green += g
                 valid += v
                 tick()
@@ -311,7 +273,7 @@ def full_cover(s: Session, p: Params, progress=None, workers: int = None) -> dic
         # round-robin so the shorter tail strip is spread, not piled on one worker
         chunks = [wins[i::workers] for i in range(workers)]
         with cf.ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = [ex.submit(_cover_worker, s.path, ch, bands, s.scaling, p, tick)
+            futs = [ex.submit(_cover_worker, s.path, ch, bands, p, tick)
                     for ch in chunks if ch]
             for fut in cf.as_completed(futs):
                 g, v = fut.result()
@@ -326,51 +288,15 @@ def full_cover(s: Session, p: Params, progress=None, workers: int = None) -> dic
     return out
 
 
-# ── Per-polygon (zonal) cover ───────────────────────────────────────────────
-
-def zonal_cover(s: Session, geojson_path: str, p: Params) -> tuple:
-    """Return (FeatureCollection in WGS84 with canopy_cover_pct, rows)."""
-    import geopandas as gpd
-    if not s.georeferenced:
-        raise RuntimeError("Per-plot cover needs a georeferenced raster.")
-    gdf = gpd.read_file(geojson_path)
-    if gdf.crs is None:
-        gdf = gdf.set_crs(4326)
-    bands = [i + 1 for i in s.rgb_idx]
-    rows = []
-    with rasterio.open(s.path) as ds:
-        nd = ds.nodata if ds.nodata is not None else 0
-        g = gdf.to_crs(ds.crs)
-        for i, geom in enumerate(g.geometry):
-            props = {k: v for k, v in gdf.iloc[i].items() if k != "geometry"}
-            pid = props.get("plot_id", props.get("id", props.get("name", i + 1)))
-            try:
-                out, _ = rasterio.mask.mask(ds, [geom], crop=True, indexes=bands,
-                                            filled=True, nodata=nd)
-                vmask = ~np.all(out == nd, axis=0) & ~np.all(out == 0, axis=0)
-                rgb8 = s.scaling.apply(out)
-                m = canopeo_mask(rgb8[0], rgb8[1], rgb8[2], p) & vmask
-                v, gpx = int(vmask.sum()), int(m.sum())
-                cover = round(gpx / v * 100.0, 2) if v else None
-            except ValueError:            # polygon does not overlap the raster
-                v, gpx, cover = 0, 0, None
-            row = {"plot": str(pid), "cover_pct": cover,
-                   "valid_px": v, "green_px": gpx}
-            if s.px_area_m2 and v:
-                row["area_m2"] = round(v * s.px_area_m2, 1)
-                row["green_m2"] = round(gpx * s.px_area_m2, 1)
-            rows.append(row)
-    gdf["canopy_cover_pct"] = [r["cover_pct"] for r in rows]
-    fc = json.loads(gdf.to_crs(4326).to_json())
-    return fc, rows
-
-
 # ── Exports ─────────────────────────────────────────────────────────────────
 
 def save_mask(s: Session, p: Params, out_path: str) -> str:
     """Binary canopy mask as a GeoTIFF (1=canopy, 0=other, 255=nodata)."""
     if not out_path.lower().endswith((".tif", ".tiff")):
         out_path += ".tif"
+    if os.path.exists(out_path) and os.path.samefile(out_path, s.path):
+        raise RuntimeError("The mask cannot be saved over the orthomosaic "
+                           "itself. Choose a different file name.")
     bands = tuple(i + 1 for i in s.rgb_idx)
     with rasterio.open(s.path) as ds:
         profile = {"driver": "GTiff", "height": ds.height, "width": ds.width,
@@ -382,8 +308,7 @@ def save_mask(s: Session, p: Params, out_path: str) -> str:
             for win in _iter_strips(ds):
                 chw = ds.read(bands, window=win)
                 vmask = _validity(ds, chw, window=win)
-                rgb8 = s.scaling.apply(chw)
-                m = canopeo_mask(rgb8[0], rgb8[1], rgb8[2], p) & vmask
+                m = canopeo_mask(chw[0], chw[1], chw[2], p) & vmask
                 out = np.where(vmask, m.astype(np.uint8), 255).astype(np.uint8)
                 dst.write(out, 1, window=win)
     return out_path
@@ -393,7 +318,8 @@ def save_rows_csv(rows: list, out_path: str) -> str:
     import csv
     if not out_path.lower().endswith(".csv"):
         out_path += ".csv"
-    keys = ["plot", "cover_pct", "valid_px", "green_px", "area_m2", "green_m2"]
+    keys = ["plot", "cover_pct", "valid_px", "green_px", "area_m2", "green_m2",
+            "rg_threshold", "bg_threshold", "exg_threshold"]
     keys = [k for k in keys if any(k in r for r in rows)]
     with open(out_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
@@ -432,35 +358,51 @@ def shape_geometry_wgs84(shape: dict):
     return Polygon(ring)
 
 
-def import_geojson_shapes(path: str) -> list:
-    """GeoJSON file -> list of shapes (WGS84 polygons) with a 'name'."""
+def import_geojson_shapes(path: str) -> tuple:
+    """GeoJSON file -> (shapes, warnings). Shapes are WGS84 polygons with a
+    'name'. A shape is a single outer ring, so multi-part features keep only
+    their largest part and interior holes are dropped; warnings says so."""
     import geopandas as gpd
     gdf = gpd.read_file(path)
     if gdf.crs is None:
         gdf = gdf.set_crs(4326)
     gdf = gdf.to_crs(4326)
     shapes = []
+    n_multi = n_holes = n_skipped = 0
     for i, row in gdf.iterrows():
         geom = row.geometry
         if geom is None or geom.is_empty:
             continue
         if geom.geom_type == "MultiPolygon":
+            n_multi += len(geom.geoms) > 1
             geom = max(geom.geoms, key=lambda g: g.area)
         if geom.geom_type != "Polygon":
+            n_skipped += 1
             continue
+        n_holes += len(geom.interiors) > 0
         props = {k: v for k, v in row.items() if k != "geometry"}
         name = props.get("plot_id", props.get("id", props.get("name", f"plot {i + 1}")))
-        coords = [[float(y), float(x)] for x, y in geom.exterior.coords]
+        # *_ swallows an optional Z coordinate (common in survey / KML exports)
+        coords = [[float(y), float(x)] for x, y, *_ in geom.exterior.coords]
         shapes.append({"type": "polygon", "coords": coords, "name": str(name)})
-    return shapes
+    warnings = []
+    if n_multi:
+        warnings.append(f"{n_multi} multi-part feature(s): only the largest "
+                        "part of each was kept.")
+    if n_holes:
+        warnings.append(f"{n_holes} polygon(s) have holes: the holes are "
+                        "ignored, so their interior is counted.")
+    if n_skipped:
+        warnings.append(f"{n_skipped} non-polygon feature(s) skipped.")
+    return shapes, warnings
 
 
 def areas_cover(s: Session, shapes: list, p: Params) -> list:
-    """Cover for each shape (WGS84) at full resolution. Returns list of dicts."""
+    """Cover for each shape (WGS84) at full resolution. Returns list of dicts.
+    Each result carries the thresholds it was computed with, so exports stay
+    self-describing even if the sliders move afterwards."""
     from shapely.ops import transform as shp_transform
     from pyproj import Transformer
-    if not s.georeferenced:
-        raise RuntimeError("Areas need a georeferenced raster.")
     bands = [i + 1 for i in s.rgb_idx]
     out = []
     with rasterio.open(s.path) as ds:
@@ -472,16 +414,17 @@ def areas_cover(s: Session, shapes: list, p: Params) -> list:
                 arr, _ = rasterio.mask.mask(ds, [geom], crop=True, indexes=bands,
                                             filled=True, nodata=nd)
                 vmask = ~np.all(arr == nd, axis=0) & ~np.all(arr == 0, axis=0)
-                rgb8 = s.scaling.apply(arr)
-                m = canopeo_mask(rgb8[0], rgb8[1], rgb8[2], p) & vmask
+                m = canopeo_mask(arr[0], arr[1], arr[2], p) & vmask
                 v, g = int(vmask.sum()), int(m.sum())
                 cover = round(g / v * 100.0, 2) if v else None
             except ValueError:                 # outside the raster
                 v, g, cover = 0, 0, None
-            row = {"cover_pct": cover, "valid_px": v, "green_px": g}
-            if s.px_area_m2 and v:
-                row["area_m2"] = round(v * s.px_area_m2, 1)
-                row["green_m2"] = round(g * s.px_area_m2, 1)
+            row = {"cover_pct": cover, "valid_px": v, "green_px": g,
+                   "rg_threshold": p.rg, "bg_threshold": p.bg,
+                   "exg_threshold": p.exg}
+            if s.px_area_m2:        # always set, so a re-run clears old values
+                row["area_m2"] = round(v * s.px_area_m2, 1) if v else None
+                row["green_m2"] = round(g * s.px_area_m2, 1) if v else None
             out.append(row)
     return out
 
@@ -492,7 +435,11 @@ def areas_to_geojson(areas: list) -> dict:
     feats = []
     for a in areas:
         props = {"name": a.get("name"), "canopy_cover_pct": a.get("cover_pct"),
-                 "area_m2": a.get("area_m2"), "valid_px": a.get("valid_px"),
+                 "area_m2": a.get("area_m2"), "green_m2": a.get("green_m2"),
+                 "valid_px": a.get("valid_px"), "green_px": a.get("green_px"),
+                 "rg_threshold": a.get("rg_threshold"),
+                 "bg_threshold": a.get("bg_threshold"),
+                 "exg_threshold": a.get("exg_threshold"),
                  "source": a.get("source", "drawn")}
         feats.append({"type": "Feature", "properties": props,
                       "geometry": mapping(shape_geometry_wgs84(a))})

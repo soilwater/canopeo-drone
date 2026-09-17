@@ -3,7 +3,7 @@
 ; Then open this file in Inno Setup and click Compile.
 
 #define AppName "Canopeo Drone"
-#define AppVersion "0.3.0"
+#define AppVersion "0.4.0"
 #define AppPublisher "Andres Patrignani and Tyson E. Ochsner"
 #define AppURL "https://soilwater.github.io/canopeo-drone/"
 #define AppExe "CanopeoDrone.exe"

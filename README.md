@@ -1,7 +1,7 @@
 # Canopeo Drone
 
 Green canopy cover for drone and satellite orthomosaics, as a desktop
-application. Load a GeoTIFF (RGB or multispectral), see the Canopeo
+application. Load an 8-bit RGB GeoTIFF, see the Canopeo
 classification draped over satellite imagery, tune the thresholds, draw
 areas or load plot boundaries, and export masks and per-area results.
 
@@ -15,8 +15,8 @@ Project page: https://soilwater.github.io/canopeo-drone/
 * **End users** run the packaged `.exe` (see Packaging). It bundles Python,
   guile, and every library, so nothing needs to be installed. Windows 10/11
   already has the WebView2 runtime it uses.
-* **Running from source** needs Python 3.11+ and `guile >= 0.8.7`, plus the
-  packages in `app/requirements.txt`.
+* **Running from source** needs Python 3.11+ and the packages in
+  `app/requirements.txt` (which installs `guile >= 0.8.7` from its repo).
 * **Building the installer** needs `guile >= 0.8.7` (see Packaging).
 
 ## Repo layout
@@ -36,32 +36,41 @@ python app/main.py            # add --dev for hot reload
 
 ## Inputs
 
-Canopeo Drone takes **georeferenced GeoTIFF orthomosaics** only (RGB, RGBA, or
-multispectral, any bit depth). A file without a coordinate system, or a plain
-photo (JPEG, PNG, camera RAW), is rejected at load with a note pointing to
-Canopeo Drag&Drop — the companion tool for ordinary photos.
+Canopeo Drone takes **georeferenced, 8-bit RGB GeoTIFF orthomosaics** only.
+Canopeo was developed for standard 8-bit RGB images, so the app enforces that
+format instead of converting for the user:
 
-Multispectral band mapping is detected from the file's color tags, then by
-sensor preset (8-band PlanetScope → R6/G4/B2, 5-band MicaSense → R3/G2/B1),
-else bands 1/2/3.
+* A file without a coordinate system, or a plain photo (JPEG, PNG, camera
+  RAW), is rejected at load with a note pointing to Canopeo Drag&Drop — the
+  companion tool for ordinary photos.
+* A GeoTIFF that is not `uint8` with at least 3 bands (16-bit, float
+  reflectance, single band) is rejected with a note to export 8-bit RGB from
+  the photogrammetry software.
+
+Extra bands are fine (RGBA, or RGB + NIR): red, green, and blue come from the
+file's color tags, else bands 1/2/3. Pixel values are classified exactly as
+stored; nothing is rescaled.
 
 ## How the numbers are computed
 
 * **Whole-field cover** streams the full-resolution raster in row strips
-  (a 10874 × 7787 8-band scene takes ~8 s) — never loaded whole, so multi-GB
-  orthomosaics are fine. The map shows a fast overview preview while it runs;
+  across worker threads — never loaded whole, so multi-GB orthomosaics are
+  fine. Strips are capped at ~16 MP so memory does not grow with image width. The map shows a fast overview preview while it runs;
   the badge switches to the exact value when done.
-* **Scaling** is one global 2–98 percentile stretch to 8-bit computed from an
-  overview and applied identically everywhere, so stitch seams and
-  tile-to-tile contrast do not move the Canopeo decision boundary.
 * **Nodata** (alpha band, nodata value, internal mask, all-black pixels) is
   excluded from both numerator and denominator.
 * **Areas** are one list, whether drawn on the map (rectangle, polygon, circle
   — via guile's `drawn=` layer) or loaded from a GeoJSON of plot boundaries.
   Each is reprojected to the raster CRS and masked at full resolution; circles
-  are buffered in meters. Areas show a neon outline with a cover pill, can be
+  are buffered in meters. Imported shapes are single outer rings: multi-part
+  features keep their largest part and holes are ignored (the app warns when
+  this happens); Z coordinates are accepted. Areas show a neon outline with a cover pill, can be
   edited or deleted with the map toolbar (covers recompute automatically), and
-  export as CSV / GeoJSON.
+  export as CSV / GeoJSON. Both exports record the thresholds each area was
+  computed with.
+* **Ground units**: pixel size and areas are converted to meters from the
+  CRS's linear unit, so State Plane (feet) orthomosaics report correct cm/px
+  and hectares. Geographic (lat/lon) rasters report cover but no areas.
 * **Canopeo rule** (Patrignani & Ochsner, 2015): a pixel is canopy when
   `R/G < rg`, `B/G < bg`, and `2G − R − B > exg` (defaults 0.95 / 0.95 / 20).
   Raise *excess green* to reject the green tint JPEG compression adds.
@@ -97,8 +106,8 @@ generic hard parts — bundling only the native WebView2 backend, raising the
 recursion limit, and putting conda's `Library\bin` on PATH during the build.
 `build.py` adds the geospatial specifics: the GDAL / PROJ data directories, a
 full collection of `rasterio` / `pyproj` / `pyogrio` (compiled submodules
-PyInstaller cannot see statically), the icon, license, and logos, and excludes for the heavy optional stacks (TensorFlow, dask, numba, OpenCV, …)
-that pandas/geopandas extras would otherwise pull in from a full environment.
+PyInstaller cannot see statically), the icon, license, and logos, and excludes for the heavy optional stacks (TensorFlow,
+dask, numba, OpenCV, …) that pandas/geopandas extras would otherwise pull in from a full environment.
 Building from a clean venv (`app/requirements.txt`) makes those excludes
 unnecessary.
 
@@ -111,8 +120,8 @@ Verify a build without opening a window:
 dist\CanopeoDrone\CanopeoDrone.exe --smoke smoke.txt
 ```
 
-which exercises GDAL, PROJ, shapely, pyogrio, the tile server, logo, and
-license, and writes `RESULT: OK` (exit code 0) to `smoke.txt`.
+which exercises GDAL, PROJ, shapely, pyogrio, the input-format checks, the
+tile server, logo, and license, and writes `RESULT: OK` (exit code 0) to `smoke.txt`.
 
 The `onedir` folder build (~270 MB) is the one to ship; wrap it with an
 installer such as Inno Setup. Target machines need Windows 10/11 with the

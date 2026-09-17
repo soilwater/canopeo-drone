@@ -42,7 +42,7 @@ if FROZEN:
 sys.path.insert(0, APP_DIR)
 import engine as E  # noqa: E402
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 HOMEPAGE = "https://soilwater.github.io/canopeo-drone/"
 
 # ── TILESERVER (optional) ───────────────────────────────────────────────────
@@ -71,7 +71,7 @@ blend       = gui.state(DEF_BLEND)   # 0-100
 color       = gui.state("#00ff00")
 show_ovl    = gui.state(True)
 
-preview_png = gui.state(None)        # bytes (fallback overlay / JPEG view)
+preview_png = gui.state(None)        # bytes (fallback overlay without tiles)
 preview_cc  = gui.state(None)        # % from the display overview
 full        = gui.state(None)        # dict from engine.full_cover
 full_prog   = gui.state(0.0)
@@ -146,7 +146,7 @@ def zoom_for(bounds, px_w=900, px_h=760) -> int:
     lat_span = max(n - s, 1e-6)
     zx = math.log2(360.0 * px_w / (256.0 * lon_span))
     zy = math.log2(170.0 * px_h / (256.0 * lat_span))
-    return int(max(2, min(22, math.floor(min(zx, zy)))))
+    return int(max(2, min(MAX_ZOOM, math.floor(min(zx, zy)))))
 
 
 def _data_uri(relpath: str, mime: str) -> str:
@@ -195,7 +195,14 @@ def run_full():
         if full_pending.value:
             run_full()
 
-    gui.task(work, on_done=done, busy=busy_full)
+    def fail(exc):
+        if sess.value is s:
+            gui.notify(f"Full-resolution analysis failed: {exc}",
+                       variant="danger", duration=8)
+        if full_pending.value:       # a newer request is waiting; still run it
+            run_full()
+
+    gui.task(work, on_done=done, on_error=fail, busy=busy_full)
 
 
 def _tiles_update(new_source=False):
@@ -264,12 +271,11 @@ def load_image(path):
         sel_area.set(None)
         refresh_preview()
         _tiles_update(new_source=True)
-        if s.bounds:
-            view.set({"center": s.center, "zoom": zoom_for(s.bounds)})
-        for n in s.notes:
-            gui.notify(n, variant="warning", duration=6)
+        view.set({"center": s.center, "zoom": zoom_for(s.bounds)})
         run_full()
-        run_areas()                  # re-apply existing areas to the new image
+        # existing areas carry values from the previous image: blank, then redo
+        areas.update(lambda a: [dict(x, cover_pct=None) for x in a])
+        run_areas()
 
     def fail(exc):
         gui.notify(str(exc), variant="danger", duration=8)
@@ -288,7 +294,7 @@ def run_areas():
     """Cover for every area in the background; re-queues on change."""
     s = sess.value
     snapshot = list(areas.value)
-    if s is None or not s.georeferenced or not snapshot:
+    if s is None or not snapshot:
         return
     if busy_areas.value:
         areas_pending.set(True)
@@ -302,16 +308,24 @@ def run_areas():
         return E.areas_cover(s, shapes, p)
 
     def done(results):
-        by_id = dict(zip(ids, results))
+        if sess.value is s:          # drop results computed on a replaced image
+            by_id = dict(zip(ids, results))
 
-        def merge(cur):
-            return [dict(a, **by_id[a["id"]]) if a["id"] in by_id else a
-                    for a in cur]
-        areas.update(merge)
+            def merge(cur):
+                return [dict(a, **by_id[a["id"]]) if a["id"] in by_id else a
+                        for a in cur]
+            areas.update(merge)
         if areas_pending.value:
             run_areas()
 
-    gui.task(work, on_done=done, busy=busy_areas)
+    def fail(exc):
+        if sess.value is s:
+            gui.notify(f"Area analysis failed: {exc}", variant="danger",
+                       duration=8)
+        if areas_pending.value:
+            run_areas()
+
+    gui.task(work, on_done=done, on_error=fail, busy=busy_areas)
 
 
 def on_shape(shape_type, coords):
@@ -353,7 +367,7 @@ def load_plots(path):
         return
     plots_pick.set("")
     try:
-        shapes = E.import_geojson_shapes(path)
+        shapes, warnings = E.import_geojson_shapes(path)
     except Exception as exc:
         gui.notify(f"Could not read GeoJSON: {exc}", variant="danger", duration=8)
         return
@@ -364,6 +378,8 @@ def load_plots(path):
            for sh in shapes]
     areas.update(lambda a: a + new)
     gui.notify(f"{len(new)} plots loaded from {os.path.basename(path)}")
+    for w in warnings:
+        gui.notify(w, variant="warning", duration=8)
     run_areas()
 
 
@@ -386,10 +402,10 @@ def export_mask(path):
 
 
 def _area_rows():
+    opt = ("area_m2", "green_m2", "rg_threshold", "bg_threshold", "exg_threshold")
     return [{"plot": a.get("name"), "cover_pct": a.get("cover_pct"),
              "valid_px": a.get("valid_px", 0), "green_px": a.get("green_px", 0),
-             **({"area_m2": a["area_m2"]} if "area_m2" in a else {}),
-             **({"green_m2": a["green_m2"]} if "green_m2" in a else {})}
+             **{k: a[k] for k in opt if k in a}}
             for a in areas.value]
 
 
@@ -516,13 +532,12 @@ def analyze_tab():
                  key="show-ovl")
     gui.select(COLORS, "Mask color", value=color,
                on_change=lambda v: set_display_param(color, v), key="color")
-    if s is not None and s.georeferenced:
+    if s is not None:
         gui.select(TILES, "Basemap", value=tiles, on_change=tiles.set, key="tiles")
 
 
 def areas_tab():
-    s = sess.value
-    geo = s is not None and s.georeferenced
+    geo = sess.value is not None
     gui.text("Draw rectangles, polygons, or circles with the map toolbar, or "
              "load a GeoJSON of plot boundaries. Each area gets its own canopy "
              "cover. Edit or delete areas with the toolbar.",
@@ -623,8 +638,8 @@ def modals():
                    on_close=lambda: show_about.set(False), width=460,
                    key="about-modal"):
         gui.text(f"Canopeo Drone v{VERSION}", bold=True)
-        gui.text("Green canopy cover from drone and satellite imagery, using "
-                 "the Canopeo algorithm.", size="sm")
+        gui.text("Green canopy cover from georeferenced RGB orthomosaics, "
+                 "using the Canopeo algorithm.", size="sm")
         gui.text("Canopeo classifies a pixel as green canopy when R/G and B/G "
                  "are below their thresholds and the excess green index "
                  "(2G − R − B) is above its threshold.", size="sm", muted=True)
@@ -659,9 +674,11 @@ def modals():
         with gui.scroll(max_height=520):
             with gui.col(gap=10):
                 gui.text("Workflow", bold=True, size="sm")
-                gui.text("1. Load a georeferenced GeoTIFF orthomosaic (RGB or "
-                         "multispectral). For plain photos, use Canopeo Drag&Drop.",
-                         size="sm")
+                gui.text("1. Load a georeferenced GeoTIFF orthomosaic in standard "
+                         "8-bit RGB. Other pixel formats (16-bit, multispectral "
+                         "reflectance) are not accepted: export 8-bit RGB from "
+                         "your photogrammetry software. For plain photos, use "
+                         "Canopeo Drag&Drop.", size="sm")
                 gui.text("2. The map shows the classified image over satellite "
                          "imagery. Whole-image cover shows a quick preview first, "
                          "then the exact full-resolution value.", size="sm")
@@ -687,14 +704,15 @@ def modals():
                 gui.divider()
                 gui.text("What is counted", bold=True, size="sm")
                 gui.text("Transparent, nodata, and all-black pixels (stitching "
-                         "borders) are excluded from the calculation. Multispectral "
-                         "bands are mapped to RGB automatically (PlanetScope "
-                         "8-band, MicaSense 5-band, or the color tags in the file).", size="sm")
-                gui.text("One brightness stretch is applied to the whole image so "
-                         "thresholds behave the same across orthomosaic seams. "
-                         "Stitching artifacts and compression can still bias "
-                         "results, so always check the overlay visually.",
-                         size="sm")
+                         "borders) are excluded from the calculation. Red, green, "
+                         "and blue come from the color tags in the file, or bands "
+                         "1/2/3 when the file has none.", size="sm")
+                gui.text("Pixel values are classified exactly as stored; nothing "
+                         "is rescaled. Stitching artifacts and compression can "
+                         "still bias results, so always check the overlay "
+                         "visually.", size="sm")
+                gui.text("Exported CSV and GeoJSON files record the thresholds "
+                         "each area was computed with.", size="sm")
                 gui.divider()
                 gui.text("Large files", bold=True, size="sm")
                 gui.text("Orthomosaics are read in strips and map tiles are "
@@ -831,7 +849,18 @@ def _smoke(log_path: str) -> int:
         s = E.open_session(_tif)
         r = E.full_cover(s, E.Params())
         lines.append(f"GeoTIFF cover {r['cover']:.1f}% (expect ~50), CRS {s.crs}")
-        ok &= abs(r["cover"] - 50.0) < 2.0 and s.georeferenced
+        ok &= abs(r["cover"] - 50.0) < 2.0
+        # a 16-bit raster must be refused: only standard 8-bit RGB is accepted
+        _tif16 = os.path.join(tempfile.gettempdir(), "canopeo_smoke16.tif")
+        with rasterio.open(_tif16, "w", driver="GTiff", height=8, width=8, count=3,
+                           dtype="uint16", crs="EPSG:32614",
+                           transform=from_origin(563000, 4252000, 3, 3)) as _ds:
+            _ds.write(_np.ones((3, 8, 8), _np.uint16))
+        try:
+            E.open_session(_tif16)
+            lines.append("reject 16-bit: NOT rejected"); ok = False
+        except RuntimeError:
+            lines.append("reject 16-bit: ok")
         # a non-GeoTIFF input must be refused
         try:
             E.open_session(_tif[:-4] + ".jpg")
@@ -854,10 +883,10 @@ def _smoke(log_path: str) -> int:
         _gj = os.path.join(tempfile.gettempdir(), "canopeo_smoke.geojson")
         with open(_gj, "w", encoding="utf-8") as _f:
             _json.dump(_fc, _f)
-        shapes = E.import_geojson_shapes(_gj)
+        shapes, _warn = E.import_geojson_shapes(_gj)
         lines.append(f"GeoJSON read (pyogrio): {len(shapes)} polygons")
         ok &= len(shapes) == 2
-        for _f in (_tif, _gj):
+        for _f in (_tif, _tif16, _gj):
             try:
                 os.remove(_f)
             except OSError:

@@ -9,7 +9,6 @@ __pycache__/
 /Soybean Tiff Files/
 /example_image_psscene*/
 *.tif
-!demo/*.tif
 
 # Inno Setup output
 /installer/Output/

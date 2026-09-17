@@ -22,7 +22,8 @@ Usage
     srv = CanopeoTileServer()               # starts listening
     srv.set_source(session, params)         # after engine.open_session()
     srv.set_params(params)                  # on every threshold change
-    gui.TileOverlay(srv.url, max_zoom=28, bounds=session.bounds)
+    # main.py then hands srv.url to gui.leaflet as a plain tile-layer dict
+    # (gui.TileOverlay caps maxZoom at 24; the dict lifts it to 28).
 """
 
 from __future__ import annotations
@@ -130,9 +131,8 @@ class _Source:
         if not valid.any():
             return _empty_png()
 
-        rgb8 = self.session.scaling.apply(chw)
-        rgb = np.ascontiguousarray(np.transpose(rgb8, (1, 2, 0)))
-        mask = E.canopeo_mask(rgb8[0], rgb8[1], rgb8[2], params) & valid
+        rgb = np.ascontiguousarray(np.transpose(chw, (1, 2, 0)))
+        mask = E.canopeo_mask(chw[0], chw[1], chw[2], params) & valid
         blended = E.blend_rgb(rgb, mask, params)
         rgba = np.dstack([blended, (valid * 255).astype(np.uint8)])
 
@@ -204,7 +204,7 @@ class CanopeoTileServer:
         old, self._source = self._source, None
         if old is not None:
             old.close()
-        if session is not None and session.georeferenced:
+        if session is not None:
             self._source = _Source(session)
         self.set_params(params)
 
