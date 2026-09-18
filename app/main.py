@@ -1,7 +1,7 @@
 """
 Canopeo Drone — green canopy cover for drone & satellite imagery.
 
-Desktop app built with guile (>= 0.8.9). Sidebar holds the controls; the
+Desktop app built with guile (>= 0.9.1). Sidebar holds the controls; the
 map with the classified orthomosaic draped over satellite imagery is the
 main view. Areas of interest (drawn on the map or loaded from GeoJSON)
 get their own canopy cover.
@@ -43,7 +43,7 @@ if FROZEN:
 sys.path.insert(0, APP_DIR)
 import engine as E  # noqa: E402
 
-VERSION = "0.4.1"
+VERSION = "0.5.0"
 HOMEPAGE = "https://soilwater.github.io/canopeo-drone/"
 
 # ── TILESERVER (optional) ───────────────────────────────────────────────────
@@ -83,9 +83,13 @@ tile_url    = gui.state("")          # current tile template (changes with param
 # Areas: drawn shapes and file plots in one list. Each entry is what guile's
 # draw tools deliver ({id, type, coords}) plus name/source/results.
 areas       = gui.state([])
-sel_area    = gui.state(None)        # id of the selected area
 areas_pending = gui.state(False)
 _area_seq   = [0]
+
+# Analysis boundary (AOI). Drawn while the Pre-process tab is open; limits every
+# cover calculation to the area of interest. None = whole image.
+aoi         = gui.state(None)        # drawn-shape dict, or None
+active_tab  = gui.state("Open")      # selected sidebar tab (drives draw target)
 
 tiles       = gui.state("none")      # default: no basemap (drone > basemap res)
 view        = gui.state({"center": (39.19, -96.58), "zoom": 5})
@@ -96,15 +100,38 @@ show_about  = gui.state(False)
 show_license = gui.state(False)
 show_guide  = gui.state(False)
 
+# RGB band picker (for multi-band / multispectral GeoTIFFs). Band numbers are
+# 1-based strings for the selects; the engine takes 0-based indices.
+show_bands  = gui.state(False)
+band_r      = gui.state("1")
+band_g      = gui.state("2")
+band_b      = gui.state("3")
+
 COLORS = [("#00ff00", "Green"), ("#ffffff", "White"), ("#f6ff00", "Yellow"),
           ("#00ffff", "Cyan"), ("#ff007f", "Magenta")]
 TILES = [("none", "None"), ("satellite", "Satellite")]
 
+# Sidebar navigation (guile >= 0.9.1 icon rail). "value" is the stable id used
+# for routing and for the draw-target check in on_shape; "label" is displayed.
+NAV = [
+    {"value": "Open", "label": "Open", "icon": gui.icon("folder-open")},
+    {"value": "Pre-process", "label": "Pre-process", "icon": gui.icon("crop")},
+    {"value": "Analyze", "label": "Analyze",
+     "icon": gui.icon("sliders-horizontal")},
+    {"value": "Areas", "label": "Areas", "icon": gui.icon("shapes")},
+    {"value": "Export", "label": "Export", "icon": gui.icon("download")},
+]
+
 NEON = "#39ff14"
-AREA_STYLE = {"color": NEON, "weight": 3, "opacity": 1.0,
+BOUNDARY = "#ffb300"                  # amber; distinct from neon-green areas
+AREA_STYLE = {"color": NEON, "weight": 2, "opacity": 1.0,
               "fill_color": NEON, "fill_opacity": 0.06}
-AREA_SELECTED = {"color": "#ffffff", "weight": 4, "opacity": 1.0,
-                 "fill_color": NEON, "fill_opacity": 0.18}
+# The boundary rides the same managed drawn= layer as areas (a clean
+# clear-and-rebuild), not a map overlay — overlays cross-fade on the tile
+# load timer, which left stale boundary outlines ("trails") on mask changes.
+AOI_ID = "__aoi__"
+BOUNDARY_STYLE = {"color": BOUNDARY, "weight": 2, "opacity": 1.0,
+                  "fill_color": BOUNDARY, "fill_opacity": 0.0}
 
 # Zoom ceiling. Web-Mercator zoom 24 is ~0.7 cm/px at mid latitudes, coarser
 # than a 0.2 cm/px drone mosaic, so allow 28 (~0.05 cm/px). Basemaps stop at
@@ -269,19 +296,61 @@ def load_image(path):
         full.set(None)
         full_pending.set(False)
         stale.set(False)
-        sel_area.set(None)
+        aoi.set(None)                # the previous image's boundary does not apply
+        active_tab.set("Analyze")    # land on results once an image is in
+        band_r.set(str(s.rgb_idx[0] + 1))
+        band_g.set(str(s.rgb_idx[1] + 1))
+        band_b.set(str(s.rgb_idx[2] + 1))
         refresh_preview()
         _tiles_update(new_source=True)
         view.set({"center": s.center, "zoom": zoom_for(s.bounds)})
-        run_full()
         # existing areas carry values from the previous image: blank, then redo
         areas.update(lambda a: [dict(x, cover_pct=None) for x in a])
-        run_areas()
+        if s.bands > 3:
+            show_bands.set(True)     # multispectral: confirm R/G/B before running
+        else:
+            run_full()
+            run_areas()
 
     def fail(exc):
         gui.notify(str(exc), variant="danger", duration=8)
 
     gui.task(work, on_done=done, on_error=fail, busy=busy_load)
+
+
+# ── Callbacks: RGB band mapping ─────────────────────────────────────────────
+
+def _band_options(n):
+    return [(str(i), f"Band {i}") for i in range(1, n + 1)]
+
+
+def open_bands_modal():
+    s = sess.value
+    if s is None:
+        return
+    band_r.set(str(s.rgb_idx[0] + 1))
+    band_g.set(str(s.rgb_idx[1] + 1))
+    band_b.set(str(s.rgb_idx[2] + 1))
+    show_bands.set(True)
+
+
+def apply_bands():
+    """Apply the chosen R/G/B bands and (re)run the analysis. Also called when
+    the modal is dismissed, so loading a multi-band image always ends up
+    processed with whatever mapping is shown."""
+    show_bands.set(False)
+    s = sess.value
+    if s is None:
+        return
+    idx = (int(band_r.value) - 1, int(band_g.value) - 1, int(band_b.value) - 1)
+    if idx != tuple(s.rgb_idx):
+        E.set_rgb_idx(s, idx)
+        if TILESERVER is not None:
+            TILESERVER.set_source(s, params())   # source caches bands; rebuild
+    full.set(None)
+    _refresh_display()
+    run_full()
+    run_areas()
 
 
 # ── Callbacks: areas ────────────────────────────────────────────────────────
@@ -329,38 +398,63 @@ def run_areas():
     gui.task(work, on_done=done, on_error=fail, busy=busy_areas)
 
 
+def set_boundary(shape_type, coords):
+    """Commit a drawn shape as the analysis boundary and re-run everything."""
+    s = sess.value
+    if s is None:
+        return
+    shape = {"type": shape_type, "coords": coords}
+    aoi.set(shape)
+    E.set_aoi(s, shape)
+    if TILESERVER is not None:
+        TILESERVER.set_aoi(s.aoi)
+    full.set(None)
+    _refresh_display()
+    recompute()
+
+
+def clear_boundary():
+    s = sess.value
+    aoi.set(None)
+    if s is not None:
+        E.set_aoi(s, None)
+    if TILESERVER is not None:
+        TILESERVER.set_aoi(None)
+    full.set(None)
+    _refresh_display()
+    recompute()
+
+
 def on_shape(shape_type, coords):
+    # On the Pre-process tab the draw tools set the boundary, not an area.
+    if active_tab.value == "Pre-process":
+        set_boundary(shape_type, coords)
+        return
     n = sum(1 for a in areas.value if a.get("source") == "drawn") + 1
     entry = {"id": _new_area_id(), "type": shape_type, "coords": coords,
              "name": f"Area {n}", "source": "drawn", "cover_pct": None}
     areas.update(lambda a: a + [entry])
-    sel_area.set(entry["id"])
     run_areas()
 
 
 def on_shape_edit(shape_id, shape_type, coords):
+    if shape_id == AOI_ID:                 # editing the boundary on the map
+        set_boundary(shape_type, coords)
+        return
     areas.update(lambda a: [dict(x, type=shape_type, coords=coords, cover_pct=None)
                             if x["id"] == shape_id else x for x in a])
     run_areas()
 
 
 def on_shape_delete(shape_id):
+    if shape_id == AOI_ID:                 # deleting the boundary on the map
+        clear_boundary()
+        return
     areas.update(lambda a: [x for x in a if x["id"] != shape_id])
-    if sel_area.value == shape_id:
-        sel_area.set(None)
-
-
-def on_shape_click(shape_id):
-    sel_area.set(None if sel_area.value == shape_id else shape_id)
-
-
-def delete_area(shape_id):
-    on_shape_delete(shape_id)
 
 
 def clear_areas():
     areas.set([])
-    sel_area.set(None)
 
 
 def load_plots(path):
@@ -437,17 +531,27 @@ def _license_text() -> str:
 
 TOOLBAR_H = 44
 BODY_H = f"calc(100vh - {TOOLBAR_H}px)"
-SIDEBAR_CSS = ("width:330px;flex-shrink:0;border-right:1px solid var(--border);"
-               f"background:var(--surface);overflow-y:auto;height:{BODY_H}")
+SIDEBAR_CSS = ("flex-shrink:0;border-right:1px solid var(--border);"
+               f"background:var(--surface);height:{BODY_H}")
+CONTENT_CSS = f"width:300px;flex-shrink:0;overflow-y:auto;height:{BODY_H}"
 TOOLBAR_CSS = (f"height:{TOOLBAR_H}px;flex-shrink:0;border-bottom:1px solid "
                "var(--border);background:var(--surface)")
 SECTION_CSS = "text-transform:uppercase;letter-spacing:.06em"
 # square map corners; let the map fill its column instead of a fixed height
 PAGE_CSS = ("<style>.guile-map{border-radius:0 !important;height:100% !important}"
-            ".guile-map-canvas{height:100% !important}</style>")
-ACCENT = "#15803d"           # Canopeo green: buttons, sliders, links, results
+            # theme-aware map backdrop (shows through the transparent 'None'
+            # basemap instead of Leaflet's default grey)
+            ".guile-map-canvas{height:100% !important;background:var(--surface-2)}"
+            # selected rail button: solid primary fill, label/icon in the page
+            # background colour so it contrasts in every theme (white on green,
+            # navy on cyan, …)
+            ".guile-rail-active{background:var(--primary) !important;"
+            "color:var(--bg) !important}</style>")
+ACCENT = "#15803d"           # Canopeo brand green (kept for reference; the UI
+#                              theme is set in ui() via gui.theme)
 PANEL_CSS = "background:var(--surface-2);box-shadow:none;border:1px solid var(--border)"
-LOAD_BTN_CSS = "width:100%;background:var(--primary);color:#fff;border-color:transparent"
+LOAD_BTN_CSS = ("width:100%;background:var(--primary);color:#fff;"
+                "border-color:transparent")
 _CAPTION = ("font-size:10.5px;font-weight:600;letter-spacing:.07em;"
             "text-transform:uppercase;color:var(--text-2)")
 _NUM = "font-variant-numeric:tabular-nums"
@@ -472,16 +576,15 @@ def _kv_html(pairs) -> str:
 
 
 def _stat_html(value: str, caption: str, note: str = "", exact: bool = True) -> str:
-    """Headline number with a small caption; muted when it is only a preview."""
+    """Headline number: caption, big value, then an optional note on its own
+    line below (stacked, so long notes never crowd the number)."""
     color = "var(--primary)" if exact else "var(--text-2)"
-    note_html = (f'<span style="font-size:11px;color:var(--text-2)">'
-                 f'{html.escape(note)}</span>') if note else ""
-    return ('<div style="display:flex;align-items:flex-end;justify-content:'
-            'space-between;gap:8px">'
-            f'<div><div style="{_CAPTION}">{html.escape(caption)}</div>'
-            f'<div style="font-size:30px;font-weight:700;line-height:1.15;'
+    note_html = (f'<div style="font-size:11px;color:var(--text-2);'
+                 f'margin-top:3px">{html.escape(note)}</div>') if note else ""
+    return (f'<div><div style="{_CAPTION}">{html.escape(caption)}</div>'
+            f'<div style="font-size:30px;font-weight:700;line-height:1.1;'
             f'letter-spacing:-.02em;color:{color};{_NUM}">{html.escape(value)}</div>'
-            f'</div>{note_html}</div>')
+            f'{note_html}</div>')
 
 
 def cover_readout():
@@ -491,6 +594,7 @@ def cover_readout():
     if s is None:
         return
     f = full.value
+    bnote = " · within boundary" if aoi.value else ""
     # Initial load: no exact value yet — show a prominent loading card in the
     # slot the cover banner will occupy, so the flow reads load → analyzing → value.
     if f is None and busy_full.value:
@@ -518,13 +622,13 @@ def cover_readout():
     if f is not None and not stale.value:
         with gui.card(gap=8, padding=12, style=PANEL_CSS, key="cc-card"):
             gui.html(_stat_html(f"{f['cover']:.2f}%", "Canopy cover",
-                                "full resolution"), key="cc-stat")
+                                "full resolution" + bnote), key="cc-stat")
         return
     # Thresholds changed (or no exact value yet): quick preview + Recompute.
     with gui.card(gap=8, padding=12, style=PANEL_CSS, key="cc-card"):
         if preview_cc.value is not None:
             gui.html(_stat_html(f"≈ {preview_cc.value:.1f}%", "Canopy cover",
-                                "preview", exact=False), key="cc-stat")
+                                "preview" + bnote, exact=False), key="cc-stat")
         gui.button("Recompute", variant="primary", size="sm", on_click=recompute,
                    key="cc-recompute", style="width:100%")
         gui.text("Thresholds changed. Recompute for the exact full-resolution "
@@ -543,13 +647,69 @@ def metadata_block(s):
         pairs.insert(2, ("Bands", f"{s.bands} · RGB = {r}/{g}/{b}"))
     f = full.value
     if f is not None and "valid_m2" in f:
-        pairs.append(("Imaged area", _fmt_area(f["valid_m2"])))
+        pairs.append(("Analyzed area", _fmt_area(f["valid_m2"])))
     name = html.escape(s.name)
     with gui.card(gap=8, padding=12, style=PANEL_CSS):
         gui.html(f'<div title="{name}" style="font-size:13px;font-weight:600;'
                  'overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'
                  f'{name}</div>', key="meta-name")
         gui.html(_kv_html(pairs), key="meta-grid")
+
+
+def open_tab():
+    gui.text("Image", bold=True, size="sm", muted=True, style=SECTION_CSS)
+    gui.file_picker("Loading…" if busy_load.value else "Load image…",
+                    value=img_pick, file_types=("GeoTIFF (*.tif;*.tiff)",),
+                    disabled=busy_load.value, on_change=load_image,
+                    key="img-load", style=LOAD_BTN_CSS)
+    if sess.value is None:
+        gui.text("Load a georeferenced 8-bit RGB GeoTIFF orthomosaic to begin. "
+                 "Other formats are rejected — see Guidelines.", size="sm",
+                 muted=True)
+    else:
+        gui.text("Loaded. Use the rail to set a boundary, tune thresholds, "
+                 "measure areas, or export results.", size="sm",
+                 muted=True)
+
+
+def preprocess_tab():
+    s = sess.value
+    if s is None:
+        gui.text("Pre-process", bold=True, size="sm", muted=True,
+                 style=SECTION_CSS)
+        gui.text("Load an image first.", size="sm", muted=True)
+        return
+    gui.text("RGB bands", bold=True, size="sm", muted=True, style=SECTION_CSS)
+    r, g, b = (i + 1 for i in s.rgb_idx)
+    gui.html(_kv_html([("Red", f"Band {r}"), ("Green", f"Band {g}"),
+                       ("Blue", f"Band {b}")]), key="band-map")
+    if s.bands > 3:
+        gui.button("Change RGB bands…", variant="ghost", size="sm",
+                   on_click=open_bands_modal, key="bands-open", style="width:100%")
+    gui.divider()
+    gui.text("Analysis boundary", bold=True, size="sm", muted=True,
+             style=SECTION_CSS)
+    gui.text("Drones capture ground beyond the field — roads, other plots, the "
+             "launch point. Draw a boundary to limit every cover calculation to "
+             "your area of interest; everything outside is excluded.",
+             size="sm", muted=True)
+    if aoi.value is None:
+        gui.text("While this tab is open, draw a rectangle, polygon, or circle "
+                 "on the map to set the boundary. The whole image is analyzed "
+                 "until you do.", size="sm", muted=True)
+        return
+    with gui.card(gap=6, padding=12, style=PANEL_CSS):
+        with gui.row(justify="space-between", align="center"):
+            gui.text("Boundary active", bold=True, size="sm")
+            gui.button("Clear", variant="ghost", size="sm",
+                       on_click=clear_boundary, key="aoi-clear")
+        f = full.value
+        pairs = [("Shape", aoi.value["type"].capitalize())]
+        if f is not None and "valid_m2" in f:
+            pairs.append(("Area", _fmt_area(f["valid_m2"])))
+        gui.html(_kv_html(pairs), key="aoi-grid")
+    gui.text("Redraw on the map to replace it, or Clear to analyze the whole "
+             "image again.", size="sm", muted=True)
 
 
 def analyze_tab():
@@ -597,29 +757,6 @@ def areas_tab():
         gui.text("Thresholds changed — press Recompute for exact area values.",
                  size="sm", muted=True)
 
-    sel = next((a for a in lst if a["id"] == sel_area.value), None)
-    if sel is not None:
-        with gui.card(gap=6, padding=12, style=PANEL_CSS):
-            with gui.row(justify="space-between", align="center"):
-                gui.text(sel.get("name", sel["id"]), bold=True, size="sm")
-                with gui.row(gap=2):
-                    gui.button("Delete", variant="ghost", size="sm",
-                               on_click=lambda: delete_area(sel["id"]),
-                               key="sel-del")
-                    gui.button("✕", variant="ghost", size="sm",
-                               on_click=lambda: sel_area.set(None), key="sel-close")
-            cc = sel.get("cover_pct")
-            gui.html(_stat_html("–" if cc is None else f"{cc:.2f}%",
-                                "Canopy cover", exact=cc is not None),
-                     key="sel-stat")
-            pairs = [("Shape", f"{sel['type'].capitalize()} · "
-                               f"{sel.get('source', 'drawn')}")]
-            if sel.get("area_m2"):
-                pairs.append(("Area", _fmt_area(sel["area_m2"])))
-            if sel.get("valid_px"):
-                pairs.append(("Pixels", f"{sel['valid_px']:,}"))
-            gui.html(_kv_html(pairs), key="sel-grid")
-
     vals = [a["cover_pct"] for a in lst if a.get("cover_pct") is not None]
     with gui.row(justify="space-between", align="center"):
         gui.text(f"{len(lst)} area{'s' if len(lst) != 1 else ''}", bold=True,
@@ -646,16 +783,15 @@ def areas_tab():
 
 
 def export_tab():
-    s = sess.value
-    have = s is not None
-    gui.text("Canopy mask", bold=True, size="sm")
+    have = sess.value is not None
+    gui.text("Canopy mask", bold=True, size="sm", muted=True, style=SECTION_CSS)
     gui.text("GeoTIFF mask (1 = canopy, 0 = other, 255 = nodata) at the current "
              "thresholds.", size="sm", muted=True)
     gui.file_picker("Save mask…", save=True, file_types=("GeoTIFF (*.tif)",),
                     disabled=not have,
                     on_change=export_mask, key="mask-save", style="width:100%")
     gui.divider()
-    gui.text("Areas", bold=True, size="sm")
+    gui.text("Areas", bold=True, size="sm", muted=True, style=SECTION_CSS)
     have_areas = bool(areas.value)
     gui.file_picker("Save areas CSV…", save=True, file_types=("csv",),
                     disabled=not have_areas, on_change=export_csv,
@@ -731,17 +867,22 @@ def modals():
                          "reflectance) are not accepted: export 8-bit RGB from "
                          "your photogrammetry software. For plain photos, use "
                          "Canopeo Drag&Drop.", size="sm")
-                gui.text("2. The map shows the classified image over satellite "
+                gui.text("2. Optional but recommended (Pre-process tab): draw an "
+                         "analysis boundary to exclude everything the drone caught "
+                         "beyond the field — roads, other plots, the launch point. "
+                         "Every cover number is then computed inside the boundary "
+                         "only.", size="sm")
+                gui.text("3. The map shows the classified image over satellite "
                          "imagery. Whole-image cover shows a quick preview first, "
                          "then the exact full-resolution value.", size="sm")
-                gui.text("3. Adjust the thresholds until the overlay matches the "
+                gui.text("4. Adjust the thresholds until the overlay matches the "
                          "canopy you see. While you drag, the map overlay and the "
                          "cover number update as a quick preview from a downscaled "
                          "image. Press Recompute for the exact full-resolution "
                          "value — on large orthomosaics that pass takes a few "
                          "seconds, so it is a deliberate step, not automatic.",
                          size="sm")
-                gui.text("4. Draw areas on the map or load a GeoJSON of plot "
+                gui.text("5. Draw areas on the map or load a GeoJSON of plot "
                          "boundaries (Areas tab). Each area shows its cover on the "
                          "map and in the table. Save results from the Export tab.", size="sm")
                 gui.divider()
@@ -758,7 +899,9 @@ def modals():
                 gui.text("Transparent, nodata, and all-black pixels (stitching "
                          "borders) are excluded from the calculation. Red, green, "
                          "and blue come from the color tags in the file, or bands "
-                         "1/2/3 when the file has none.", size="sm")
+                         "1/2/3 when the file has none. For a multi-band file you "
+                         "choose which band is R, G, and B (a picker opens on load, "
+                         "and is on the Pre-process tab).", size="sm")
                 gui.text("Pixel values are classified exactly as stored; nothing "
                          "is rescaled. Stitching artifacts and compression can "
                          "still bias results, so always check the overlay "
@@ -773,6 +916,23 @@ def modals():
                          "seconds to about a minute depending on file size.",
                          size="sm")
 
+    with gui.modal("Select RGB bands", visible=show_bands.value,
+                   on_close=apply_bands, width=440, key="bands-modal"):
+        s = sess.value
+        if s is not None:
+            gui.text(f"This image has {s.bands} bands. Choose which band is Red, "
+                     "Green, and Blue for the Canopeo calculation.", size="sm",
+                     muted=True)
+            opts = _band_options(s.bands)
+            gui.select(opts, "Red band", value=band_r, on_change=band_r.set,
+                       key="band-r")
+            gui.select(opts, "Green band", value=band_g, on_change=band_g.set,
+                       key="band-g")
+            gui.select(opts, "Blue band", value=band_b, on_change=band_b.set,
+                       key="band-b")
+            gui.button("Analyze with these bands", variant="primary",
+                       on_click=apply_bands, key="bands-apply", style="width:100%")
+
     with gui.modal("License", visible=show_license.value,
                    on_close=lambda: show_license.set(False), width=640,
                    key="license-modal"):
@@ -782,23 +942,25 @@ def modals():
 
 
 def sidebar():
-    with gui.col(padding=16, gap=12, style=SIDEBAR_CSS):
-        gui.file_picker("Loading…" if busy_load.value else "Load image…",
-                        value=img_pick,
-                        file_types=("GeoTIFF (*.tif;*.tiff)",),
-                        disabled=busy_load.value, on_change=load_image,
-                        key="img-load", style=LOAD_BTN_CSS)
-        if sess.value is not None:
-            metadata_block(sess.value)
-            cover_readout()
-        gui.divider()
-        tab = gui.tabs(["Analyze", "Areas", "Export"], key="side-tabs")
-        if tab == "Analyze":
-            analyze_tab()
-        elif tab == "Areas":
-            areas_tab()
-        else:
-            export_tab()
+    with gui.row(gap=0, align="stretch", style=SIDEBAR_CSS):
+        nav = gui.rail(NAV, value=active_tab, on_change=active_tab.set,
+                       key="side-rail",
+                       style="flex-shrink:0;border-right:1px solid var(--border)")
+        with gui.col(padding=16, gap=12, style=CONTENT_CSS):
+            if sess.value is not None:
+                metadata_block(sess.value)
+                cover_readout()
+                gui.divider()
+            if nav == "Open":
+                open_tab()
+            elif nav == "Pre-process":
+                preprocess_tab()
+            elif nav == "Analyze":
+                analyze_tab()
+            elif nav == "Areas":
+                areas_tab()
+            else:
+                export_tab()
 
 
 def _overlay_layer(s):
@@ -818,15 +980,17 @@ def _overlay_layer(s):
 
 
 def _drawn_entries():
-    """areas -> guile drawn= list: neon outline, selection highlight, cover pill."""
+    """areas -> guile drawn= list: neon outline + cover pill (+ the boundary)."""
     out = []
     for a in areas.value:
         cc = a.get("cover_pct")
         label = f"{cc:.1f}%" if cc is not None else ("…" if busy_areas.value else "")
-        d = {"id": a["id"], "type": a["type"], "coords": a["coords"], "label": label}
-        if a["id"] == sel_area.value:
-            d["style"] = AREA_SELECTED
-        out.append(d)
+        out.append({"id": a["id"], "type": a["type"], "coords": a["coords"],
+                    "label": label})
+    if aoi.value is not None:
+        out.append({"id": AOI_ID, "type": aoi.value["type"],
+                    "coords": aoi.value["coords"], "style": BOUNDARY_STYLE,
+                    "label": ""})
     return out
 
 
@@ -854,15 +1018,13 @@ def main_view():
                     drawn=_drawn_entries(), draw_style=AREA_STYLE,
                     on_shape=on_shape, on_shape_edit=on_shape_edit,
                     on_shape_delete=on_shape_delete,
-                    on_shape_click=on_shape_click,
                     on_move=on_move,
-                    on_click=lambda lat, lon: sel_area.set(None),
                     style="height:100%", key="map")
 
 
 @gui.app("Canopeo Drone", width=1320, height=880, resizable=True)
 def ui():
-    gui.theme("light", primary=ACCENT, key="theme")
+    gui.theme("neon", key="theme")
     with gui.col(gap=0, style="height:100vh;overflow:hidden"):
         gui.html(PAGE_CSS, key="page-css")
         toolbar()

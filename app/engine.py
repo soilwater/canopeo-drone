@@ -30,8 +30,11 @@ import numpy as np
 import rasterio
 import rasterio.mask
 from rasterio.enums import Resampling
+from rasterio.features import geometry_mask
+from rasterio.transform import from_bounds
 from rasterio.vrt import WarpedVRT
 from rasterio.windows import Window
+from rasterio.windows import transform as _window_transform
 
 GEOTIFF_EXTS = (".tif", ".tiff")
 
@@ -124,6 +127,10 @@ class Session:
     ov_rgb: np.ndarray                    # (H,W,3) uint8 display overview
     ov_valid: np.ndarray                  # (H,W) bool
     bounds: tuple                         # ((s,w),(n,e)) WGS84
+    # Analysis boundary (AOI) — set via set_aoi(); None means the whole image.
+    aoi: object = None                    # WGS84 shapely geometry
+    aoi_crs: object = None                # the same geometry in the raster CRS
+    ov_aoi: object = None                 # overview-resolution bool mask
 
     @property
     def center(self):
@@ -146,6 +153,64 @@ def _gsd_text(ds) -> str:
         gy = abs(ry) * 110_540
         g = (gx + gy) / 2
     return f"{g * 100:.2f} cm/px" if g < 1 else f"{g:.2f} m/px"
+
+
+# ── Analysis boundary (AOI) ──────────────────────────────────────────────────
+# One boundary per session limits every cover calculation to an area of
+# interest, so drone imagery of roads / neighbouring fields is excluded. It is
+# non-destructive: nothing is written, it is just an extra validity mask that
+# every path (full pass, tiles, preview, areas, mask export) honours.
+
+def _reproject_geom(geom_wgs84, crs):
+    """Reproject a WGS84 shapely geometry into `crs`."""
+    from shapely.ops import transform as shp_transform
+    from pyproj import Transformer
+    fwd = Transformer.from_crs("EPSG:4326", crs, always_xy=True).transform
+    return shp_transform(fwd, geom_wgs84)
+
+
+def _overview_aoi_mask(s, geom_wgs84):
+    """Bool mask (True inside the AOI) at the display-overview resolution."""
+    (south, west), (north, east) = s.bounds
+    oh, ow = s.ov_valid.shape
+    t = from_bounds(west, south, east, north, ow, oh)
+    return geometry_mask([geom_wgs84], out_shape=(oh, ow), transform=t,
+                         invert=True)
+
+
+def set_aoi(s: "Session", shape) -> None:
+    """Set (a drawn-shape dict) or clear (None) the analysis boundary."""
+    if not shape:
+        s.aoi = s.aoi_crs = s.ov_aoi = None
+        return
+    geom = shape_geometry_wgs84(shape)
+    s.aoi = geom
+    s.aoi_crs = _reproject_geom(geom, s.crs)
+    s.ov_aoi = _overview_aoi_mask(s, geom)
+
+
+def aoi_geojson(shape) -> dict:
+    """FeatureCollection (WGS84) to draw the boundary outline on the map."""
+    from shapely.geometry import mapping
+    return {"type": "FeatureCollection", "features": [
+        {"type": "Feature", "properties": {},
+         "geometry": mapping(shape_geometry_wgs84(shape))}]}
+
+
+def _win_aoi_mask(aoi_crs, win, transform):
+    """Bool mask (True inside the AOI) for one read window."""
+    return geometry_mask([aoi_crs], out_shape=(int(win.height), int(win.width)),
+                         transform=_window_transform(win, transform), invert=True)
+
+
+def _aoi_row_range(ds, aoi_crs):
+    """[row0, row1) the AOI bounding box spans, so strips clear of it are
+    skipped entirely (the boundary's whole point is trimming edges)."""
+    minx, miny, maxx, maxy = aoi_crs.bounds
+    r_top, _ = ds.index(minx, maxy)
+    r_bot, _ = ds.index(minx, miny)
+    r0, r1 = sorted((int(r_top), int(r_bot)))
+    return max(0, r0), min(ds.height, r1 + 1)
 
 
 def open_session(path: str, max_dim: int = 1400) -> Session:
@@ -182,17 +247,35 @@ def open_session(path: str, max_dim: int = 1400) -> Session:
                        ov_rgb, valid, bounds)
 
 
+
+def set_rgb_idx(s: Session, rgb_idx) -> None:
+    """Change which bands are R/G/B and rebuild the cached display overview.
+    full_cover / tiles / areas read s.rgb_idx directly, so they pick the change
+    up on their next run; only the overview (ov_rgb / ov_valid) is cached and is
+    re-read here at the overview's existing size."""
+    s.rgb_idx = tuple(int(i) for i in rgb_idx)
+    bands = tuple(i + 1 for i in s.rgb_idx)
+    oh, ow = s.ov_valid.shape
+    with rasterio.open(s.path) as ds:
+        with WarpedVRT(ds, crs="EPSG:4326", resampling=Resampling.nearest) as vrt:
+            chw = vrt.read(bands, out_shape=(3, oh, ow))
+            valid = _validity(vrt, chw, out_shape=(oh, ow))
+    s.ov_rgb = np.ascontiguousarray(np.transpose(chw, (1, 2, 0)))
+    s.ov_valid = valid
+
+
 # ── Fast preview (overview) ─────────────────────────────────────────────────
 
 def preview(s: Session, p: Params) -> tuple:
     """Return (PNG bytes with transparent invalid pixels, preview cover %)."""
     from PIL import Image
     rgb = s.ov_rgb
-    m = canopeo_mask(rgb[..., 0], rgb[..., 1], rgb[..., 2], p) & s.ov_valid
-    valid_n = int(s.ov_valid.sum())
+    valid = s.ov_valid if s.ov_aoi is None else (s.ov_valid & s.ov_aoi)
+    m = canopeo_mask(rgb[..., 0], rgb[..., 1], rgb[..., 2], p) & valid
+    valid_n = int(valid.sum())
     cover = (int(m.sum()) / valid_n * 100.0) if valid_n else 0.0
     blended = blend_rgb(rgb, m, p)
-    rgba = np.dstack([blended, (s.ov_valid * 255).astype(np.uint8)])
+    rgba = np.dstack([blended, (valid * 255).astype(np.uint8)])
     buf = io.BytesIO()
     Image.fromarray(rgba, "RGBA").save(buf, "PNG", compress_level=3)
     return buf.getvalue(), cover
@@ -212,22 +295,24 @@ def _iter_strips(ds, strip_pixels=STRIP_PIXELS):
         yield Window(0, row0, ds.width, h)
 
 
-def _count_strip(ds, win, bands, p):
+def _count_strip(ds, win, bands, p, aoi=None):
     """(green, valid) pixel counts for one row strip."""
     chw = ds.read(bands, window=win)
     vmask = _validity(ds, chw, window=win)
+    if aoi is not None:
+        vmask &= _win_aoi_mask(aoi, win, ds.transform)
     m = canopeo_mask(chw[0], chw[1], chw[2], p) & vmask
     return int(m.sum()), int(vmask.sum())
 
 
-def _cover_worker(path, wins, bands, p, tick):
+def _cover_worker(path, wins, bands, p, tick, aoi=None):
     """Process a subset of strips on its own dataset handle. GDAL datasets are
     not thread-safe to share, so each worker opens the file independently; the
     reads (GDAL) and numpy work then run in parallel across cores."""
     green = valid = 0
     with rasterio.open(path) as ds:
         for win in wins:
-            g, v = _count_strip(ds, win, bands, p)
+            g, v = _count_strip(ds, win, bands, p, aoi)
             green += g
             valid += v
             tick()
@@ -245,8 +330,13 @@ def full_cover(s: Session, p: Params, progress=None, workers: int = None) -> dic
     import threading
 
     bands = tuple(i + 1 for i in s.rgb_idx)
+    aoi = s.aoi_crs
     with rasterio.open(s.path) as ds:
         wins = list(_iter_strips(ds))
+        if aoi is not None:
+            r0, r1 = _aoi_row_range(ds, aoi)
+            wins = [w for w in wins
+                    if w.row_off < r1 and w.row_off + w.height > r0]
     n = max(1, len(wins))
     if workers is None:
         workers = min(os.cpu_count() or 4, 8)
@@ -265,7 +355,7 @@ def full_cover(s: Session, p: Params, progress=None, workers: int = None) -> dic
     if workers == 1:
         with rasterio.open(s.path) as ds:
             for win in wins:
-                g, v = _count_strip(ds, win, bands, p)
+                g, v = _count_strip(ds, win, bands, p, aoi)
                 green += g
                 valid += v
                 tick()
@@ -273,7 +363,7 @@ def full_cover(s: Session, p: Params, progress=None, workers: int = None) -> dic
         # round-robin so the shorter tail strip is spread, not piled on one worker
         chunks = [wins[i::workers] for i in range(workers)]
         with cf.ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = [ex.submit(_cover_worker, s.path, ch, bands, p, tick)
+            futs = [ex.submit(_cover_worker, s.path, ch, bands, p, tick, aoi)
                     for ch in chunks if ch]
             for fut in cf.as_completed(futs):
                 g, v = fut.result()
@@ -298,6 +388,7 @@ def save_mask(s: Session, p: Params, out_path: str) -> str:
         raise RuntimeError("The mask cannot be saved over the orthomosaic "
                            "itself. Choose a different file name.")
     bands = tuple(i + 1 for i in s.rgb_idx)
+    aoi = s.aoi_crs
     with rasterio.open(s.path) as ds:
         profile = {"driver": "GTiff", "height": ds.height, "width": ds.width,
                    "count": 1, "dtype": "uint8", "crs": ds.crs,
@@ -308,6 +399,8 @@ def save_mask(s: Session, p: Params, out_path: str) -> str:
             for win in _iter_strips(ds):
                 chw = ds.read(bands, window=win)
                 vmask = _validity(ds, chw, window=win)
+                if aoi is not None:
+                    vmask &= _win_aoi_mask(aoi, win, ds.transform)
                 m = canopeo_mask(chw[0], chw[1], chw[2], p) & vmask
                 out = np.where(vmask, m.astype(np.uint8), 255).astype(np.uint8)
                 dst.write(out, 1, window=win)
@@ -411,6 +504,10 @@ def areas_cover(s: Session, shapes: list, p: Params) -> list:
         for sh in shapes:
             try:
                 geom = shp_transform(fwd, shape_geometry_wgs84(sh))
+                if s.aoi_crs is not None:
+                    geom = geom.intersection(s.aoi_crs)
+                    if geom.is_empty:
+                        raise ValueError    # area lies outside the boundary
                 arr, _ = rasterio.mask.mask(ds, [geom], crop=True, indexes=bands,
                                             filled=True, nodata=nd)
                 vmask = ~np.all(arr == nd, axis=0) & ~np.all(arr == 0, axis=0)

@@ -47,7 +47,6 @@ HEAVY_EXCLUDES = [
 
 def gdal_proj_data():
     """(gdal_data_dir, proj_data_dir) for this environment, wheel or conda."""
-    import rasterio
     from rasterio._env import get_gdal_data
     import pyproj
     gdal = get_gdal_data()

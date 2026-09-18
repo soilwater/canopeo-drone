@@ -16,8 +16,8 @@ Project page: https://soilwater.github.io/canopeo-drone/
   guile, and every library, so nothing needs to be installed. Windows 10/11
   already has the WebView2 runtime it uses.
 * **Running from source** needs Python 3.11+ and the packages in
-  `app/requirements.txt` (which installs `guile >= 0.8.9` from its repo).
-* **Building the installer** needs `guile >= 0.8.9` (see Packaging).
+  `app/requirements.txt` (which installs `guile >= 0.9.1` from its repo).
+* **Building the installer** needs `guile >= 0.9.1` (see Packaging).
 
 ## Repo layout
 
@@ -47,9 +47,11 @@ format instead of converting for the user:
   reflectance, single band) is rejected with a note to export 8-bit RGB from
   the photogrammetry software.
 
-Extra bands are fine (RGBA, or RGB + NIR): red, green, and blue come from the
-file's color tags, else bands 1/2/3. Pixel values are classified exactly as
-stored; nothing is rescaled.
+Extra bands are fine (RGBA, RGB + NIR, or a multispectral stack): red, green,
+and blue come from the file's color tags, else bands 1/2/3. For files with more
+than 3 bands a picker opens on load so you can map Red / Green / Blue to the
+right bands (also reachable any time from the Pre-process tab). Pixel values are
+classified exactly as stored; nothing is rescaled.
 
 ## How the numbers are computed
 
@@ -59,6 +61,11 @@ stored; nothing is rescaled.
   the badge switches to the exact value when done.
 * **Nodata** (alpha band, nodata value, internal mask, all-black pixels) is
   excluded from both numerator and denominator.
+* **Analysis boundary** (Pre-process tab) is an optional area of interest drawn
+  on the map. It is non-destructive — the file is never modified — and simply
+  restricts every cover calculation (whole-field, areas, mask export, map tiles)
+  to inside the boundary, so drone imagery of roads or neighbouring fields is
+  excluded. On large files it also skips raster strips clear of the boundary.
 * **Areas** are one list, whether drawn on the map (rectangle, polygon, circle
   — via guile's `drawn=` layer) or loaded from a GeoJSON of plot boundaries.
   Each is reprojected to the raster CRS and masked at full resolution; circles
@@ -101,7 +108,7 @@ python app/build.py             # dist/CanopeoDrone/  (folder build, onedir)
 python app/build.py --console   # keep a console to see tracebacks
 ```
 
-`build.py` wraps `gui.package()` (PyInstaller). guile (>= 0.8.9) handles the
+`build.py` wraps `gui.package()` (PyInstaller). guile (>= 0.9.1) handles the
 generic hard parts — bundling only the native WebView2 backend, raising the
 recursion limit, and putting conda's `Library\bin` on PATH during the build.
 `build.py` adds the geospatial specifics: the GDAL / PROJ data directories, a

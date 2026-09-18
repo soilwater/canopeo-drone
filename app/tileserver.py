@@ -37,6 +37,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import numpy as np
 import rasterio
 from rasterio.enums import Resampling
+from rasterio.features import geometry_mask
+from rasterio.transform import from_bounds as _tile_transform
 from rasterio.vrt import WarpedVRT
 from rasterio.windows import from_bounds
 
@@ -77,6 +79,7 @@ class _Source:
         self.bands = tuple(i + 1 for i in session.rgb_idx)
         b = self.vrt.bounds
         self.bounds = (b.left, b.bottom, b.right, b.top)
+        self.aoi = None          # analysis boundary in EPSG:3857, or None
         self.lock = threading.Lock()
 
     def close(self):
@@ -128,6 +131,10 @@ class _Source:
         chw[:, r0:r1, c0:c1] = part
         dm[r0:r1, c0:c1] = part_m
         valid = (dm > 0) & ~np.all(chw == 0, axis=0)
+        if self.aoi is not None:
+            t = _tile_transform(minx, miny, maxx, maxy, TILE, TILE)
+            valid &= geometry_mask([self.aoi], out_shape=(TILE, TILE),
+                                   transform=t, invert=True)
         if not valid.any():
             return _empty_png()
 
@@ -213,6 +220,14 @@ class CanopeoTileServer:
         self._version += 1
         with self._clock:
             self._cache.clear()
+
+    def set_aoi(self, geom_wgs84):
+        """Set (a WGS84 shapely geometry) or clear (None) the boundary. Bumps
+        the version so Leaflet refetches the now-clipped tiles."""
+        if self._source is not None:
+            self._source.aoi = (None if geom_wgs84 is None
+                                else E._reproject_geom(geom_wgs84, "EPSG:3857"))
+        self.set_params(self._params)
 
     def clear(self):
         self.set_source(None, self._params)
